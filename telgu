@@ -1,17 +1,4 @@
---// RUBO PUBLIC LIVE CHAT
---// Firebase Realtime Database
---// Single-file / Mobile Friendly
-
-local FIREBASE_URL =
-    "https://zayn-c-default-rtdb.asia-southeast1.firebasedatabase.app"
-
-local Players = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
-local LocalPlayer = Players.LocalPlayer
-
---==================================================
--- HTTP REQUEST
---==================================================
+local URL = "https://zayn-c-default-rtdb.asia-southeast1.firebasedatabase.app"
 
 local Request =
     (syn and syn.request)
@@ -21,450 +8,45 @@ local Request =
     or (fluxus and fluxus.request)
 
 if not Request then
-    warn("RUBO: HTTP request function not available.")
+    warn("RUBO FIREBASE: HTTP REQUEST FUNCTION NOT FOUND")
     return
 end
 
-local function Http(method, url, body)
-    local ok, result = pcall(function()
+local HttpService = game:GetService("HttpService")
+
+local function Test()
+
+    local ok, response = pcall(function()
         return Request({
-            Url = url,
-            Method = method,
+            Url = URL .. "/messages.json",
+            Method = "GET",
             Headers = {
-                ["Content-Type"] = "application/json"
-            },
-            Body = body
+                ["Content-Type"] = "application/json",
+                ["Accept"] = "application/json"
+            }
         })
     end)
 
     if not ok then
-        return nil
-    end
-
-    return result
-end
-
---==================================================
--- CONFIG
---==================================================
-
-local MAX_MESSAGE = 250
-local COOLDOWN = 2
-local POLL_TIME = 2
-
-local Username = LocalPlayer.DisplayName
-if not Username or Username == "" then
-    Username = LocalPlayer.Name
-end
-
-Username = string.sub(Username, 1, 30)
-
-local LastSend = 0
-local Seen = {}
-
---==================================================
--- GUI
---==================================================
-
-local Gui = Instance.new("ScreenGui")
-Gui.Name = "RUBO_PublicChat"
-Gui.ResetOnSpawn = false
-Gui.IgnoreGuiInset = true
-Gui.Parent = game:GetService("CoreGui")
-
-local Main = Instance.new("Frame")
-Main.Size = UDim2.fromOffset(400, 350)
-Main.Position = UDim2.new(0.5, -200, 0.5, -175)
-Main.BackgroundColor3 = Color3.fromRGB(8, 22, 42)
-Main.BackgroundTransparency = 0.12
-Main.BorderSizePixel = 0
-Main.Parent = Gui
-
-local Corner = Instance.new("UICorner")
-Corner.CornerRadius = UDim.new(0, 14)
-Corner.Parent = Main
-
-local Stroke = Instance.new("UIStroke")
-Stroke.Color = Color3.fromRGB(40, 150, 255)
-Stroke.Transparency = 0.25
-Stroke.Thickness = 1.5
-Stroke.Parent = Main
-
---==================================================
--- TOP BAR
---==================================================
-
-local Top = Instance.new("Frame")
-Top.Size = UDim2.new(1, 0, 0, 48)
-Top.BackgroundTransparency = 1
-Top.Parent = Main
-
-local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(1, -110, 1, 0)
-Title.Position = UDim2.fromOffset(15, 0)
-Title.BackgroundTransparency = 1
-Title.Text = "RUBO  •  PUBLIC CHAT"
-Title.TextColor3 = Color3.fromRGB(90, 190, 255)
-Title.Font = Enum.Font.GothamBold
-Title.TextSize = 17
-Title.TextXAlignment = Enum.TextXAlignment.Left
-Title.Parent = Top
-
-local Status = Instance.new("TextLabel")
-Status.Size = UDim2.fromOffset(80, 25)
-Status.Position = UDim2.new(1, -90, 0, 12)
-Status.BackgroundTransparency = 1
-Status.Text = "● LIVE"
-Status.TextColor3 = Color3.fromRGB(70, 220, 140)
-Status.Font = Enum.Font.GothamBold
-Status.TextSize = 11
-Status.Parent = Top
-
---==================================================
--- CHAT SCROLL
---==================================================
-
-local Chat = Instance.new("ScrollingFrame")
-Chat.Size = UDim2.new(1, -20, 1, -112)
-Chat.Position = UDim2.fromOffset(10, 52)
-Chat.BackgroundColor3 = Color3.fromRGB(3, 12, 25)
-Chat.BackgroundTransparency = 0.25
-Chat.BorderSizePixel = 0
-Chat.ScrollBarThickness = 3
-Chat.AutomaticCanvasSize = Enum.AutomaticSize.Y
-Chat.CanvasSize = UDim2.new()
-Chat.Parent = Main
-
-local ChatCorner = Instance.new("UICorner")
-ChatCorner.CornerRadius = UDim.new(0, 10)
-ChatCorner.Parent = Chat
-
-local Layout = Instance.new("UIListLayout")
-Layout.Padding = UDim.new(0, 5)
-Layout.SortOrder = Enum.SortOrder.LayoutOrder
-Layout.Parent = Chat
-
-local Padding = Instance.new("UIPadding")
-Padding.PaddingTop = UDim.new(0, 7)
-Padding.PaddingBottom = UDim.new(0, 7)
-Padding.PaddingLeft = UDim.new(0, 7)
-Padding.PaddingRight = UDim.new(0, 7)
-Padding.Parent = Chat
-
---==================================================
--- INPUT
---==================================================
-
-local Input = Instance.new("TextBox")
-Input.Size = UDim2.new(1, -82, 0, 42)
-Input.Position = UDim2.new(0, 10, 1, -52)
-Input.BackgroundColor3 = Color3.fromRGB(10, 30, 55)
-Input.BackgroundTransparency = 0.1
-Input.BorderSizePixel = 0
-Input.PlaceholderText = "Write a message..."
-Input.PlaceholderColor3 = Color3.fromRGB(120, 145, 170)
-Input.Text = ""
-Input.TextColor3 = Color3.fromRGB(235, 245, 255)
-Input.Font = Enum.Font.Gotham
-Input.TextSize = 13
-Input.ClearTextOnFocus = false
-Input.TextXAlignment = Enum.TextXAlignment.Left
-Input.Parent = Main
-
-local InputCorner = Instance.new("UICorner")
-InputCorner.CornerRadius = UDim.new(0, 9)
-InputCorner.Parent = Input
-
-local Send = Instance.new("TextButton")
-Send.Size = UDim2.fromOffset(62, 42)
-Send.Position = UDim2.new(1, -72, 1, -52)
-Send.BackgroundColor3 = Color3.fromRGB(25, 125, 230)
-Send.BorderSizePixel = 0
-Send.Text = "SEND"
-Send.TextColor3 = Color3.new(1, 1, 1)
-Send.Font = Enum.Font.GothamBold
-Send.TextSize = 12
-Send.Parent = Main
-
-local SendCorner = Instance.new("UICorner")
-SendCorner.CornerRadius = UDim.new(0, 9)
-SendCorner.Parent = Send
-
---==================================================
--- MESSAGE CREATOR
---==================================================
-
-local function AddMessage(id, data)
-
-    if Seen[id] then
+        warn("RUBO FIREBASE ERROR:")
+        warn(tostring(response))
         return
     end
 
-    Seen[id] = true
+    print("========== RUBO FIREBASE ==========")
+    print("Status:", response.StatusCode)
+    print("Body:", tostring(response.Body))
+    print("===================================")
 
-    if type(data) ~= "table" then
-        return
-    end
-
-    local username = tostring(data.username or "Unknown")
-    local text = tostring(data.text or "")
-
-    local Message = Instance.new("Frame")
-    Message.Size = UDim2.new(1, -4, 0, 55)
-    Message.BackgroundColor3 = Color3.fromRGB(10, 29, 50)
-    Message.BackgroundTransparency = 0.15
-    Message.BorderSizePixel = 0
-    Message.Parent = Chat
-
-    local MC = Instance.new("UICorner")
-    MC.CornerRadius = UDim.new(0, 8)
-    MC.Parent = Message
-
-    local Name = Instance.new("TextLabel")
-    Name.Size = UDim2.new(1, -75, 0, 20)
-    Name.Position = UDim2.fromOffset(9, 5)
-    Name.BackgroundTransparency = 1
-    Name.Text = username
-    Name.TextColor3 = Color3.fromRGB(80, 185, 255)
-    Name.Font = Enum.Font.GothamBold
-    Name.TextSize = 12
-    Name.TextXAlignment = Enum.TextXAlignment.Left
-    Name.Parent = Message
-
-    local Text = Instance.new("TextLabel")
-    Text.Size = UDim2.new(1, -18, 0, 25)
-    Text.Position = UDim2.fromOffset(9, 25)
-    Text.BackgroundTransparency = 1
-    Text.Text = text
-    Text.TextColor3 = Color3.fromRGB(220, 232, 245)
-    Text.Font = Enum.Font.Gotham
-    Text.TextSize = 12
-    Text.TextWrapped = true
-    Text.TextXAlignment = Enum.TextXAlignment.Left
-    Text.Parent = Message
-
-    task.defer(function()
-        Chat.CanvasPosition = Vector2.new(
-            0,
-            math.max(0, Chat.AbsoluteCanvasSize.Y)
-        )
-    end)
-end
-
---==================================================
--- SEND MESSAGE
---==================================================
-
-local function SendMessage()
-
-    local text = Input.Text
-
-    if not text then
-        return
-    end
-
-    text = text:gsub("^%s+", ""):gsub("%s+$", "")
-
-    if text == "" then
-        return
-    end
-
-    if #text > MAX_MESSAGE then
-        text = string.sub(text, 1, MAX_MESSAGE)
-    end
-
-    if os.clock() - LastSend < COOLDOWN then
-        Status.Text = "● WAIT"
-        Status.TextColor3 = Color3.fromRGB(255, 190, 70)
-
-        task.delay(1, function()
-            Status.Text = "● LIVE"
-            Status.TextColor3 = Color3.fromRGB(70, 220, 140)
-        end)
-
-        return
-    end
-
-    LastSend = os.clock()
-
-    local payload = {
-        username = Username,
-        text = text,
-        timestamp = os.time()
-    }
-
-    local encoded
-
-    local success = pcall(function()
-        encoded = game:GetService("HttpService"):JSONEncode(payload)
-    end)
-
-    if not success then
-        return
-    end
-
-    local result = Http(
-        "POST",
-        FIREBASE_URL .. "/messages.json",
-        encoded
-    )
-
-    if result then
-        Input.Text = ""
+    if response.StatusCode == 200 then
+        print("RUBO: FIREBASE CONNECTED ✓")
+    elseif response.StatusCode == 401 then
+        warn("RUBO: FIREBASE RULES BLOCKING REQUEST")
+    elseif response.StatusCode == 404 then
+        warn("RUBO: FIREBASE DATABASE URL INVALID")
+    else
+        warn("RUBO: FIREBASE HTTP ERROR " .. tostring(response.StatusCode))
     end
 end
 
-Send.MouseButton1Click:Connect(SendMessage)
-
-Input.FocusLost:Connect(function(enterPressed)
-    if enterPressed then
-        SendMessage()
-    end
-end)
-
---==================================================
--- FETCH MESSAGES
---==================================================
-
-local function FetchMessages()
-
-    local result = Http(
-        "GET",
-        FIREBASE_URL .. "/messages.json",
-        ""
-    )
-
-    if not result then
-        Status.Text = "● OFFLINE"
-        Status.TextColor3 = Color3.fromRGB(255, 80, 80)
-        return
-    end
-
-    local body = result.Body
-
-    if not body or body == "null" then
-        Status.Text = "● LIVE"
-        Status.TextColor3 = Color3.fromRGB(70, 220, 140)
-        return
-    end
-
-    local data
-
-    local ok = pcall(function()
-        data = game:GetService("HttpService"):JSONDecode(body)
-    end)
-
-    if not ok or type(data) ~= "table" then
-        return
-    end
-
-    local list = {}
-
-    for id, message in pairs(data) do
-        table.insert(list, {
-            id = id,
-            data = message
-        })
-    end
-
-    table.sort(list, function(a, b)
-        return (tonumber(a.data.timestamp) or 0)
-            < (tonumber(b.data.timestamp) or 0)
-    end)
-
-    for _, item in ipairs(list) do
-        AddMessage(item.id, item.data)
-    end
-
-    Status.Text = "● LIVE"
-    Status.TextColor3 = Color3.fromRGB(70, 220, 140)
-end
-
---==================================================
--- REPORT MESSAGE
---==================================================
-
-local function ReportMessage(messageText)
-
-    if not messageText or messageText == "" then
-        return
-    end
-
-    local payload = {
-        username = Username,
-        message = string.sub(messageText, 1, MAX_MESSAGE),
-        timestamp = os.time()
-    }
-
-    local encoded = game:GetService("HttpService"):JSONEncode(payload)
-
-    Http(
-        "POST",
-        FIREBASE_URL .. "/reports.json",
-        encoded
-    )
-end
-
---==================================================
--- START
---==================================================
-
-task.spawn(function()
-
-    task.wait(1)
-
-    FetchMessages()
-
-    while Gui.Parent do
-        task.wait(POLL_TIME)
-        FetchMessages()
-    end
-
-end)
-
---==================================================
--- DRAG SUPPORT
---==================================================
-
-local dragging = false
-local dragStart
-local startPos
-
-Top.InputBegan:Connect(function(input)
-
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-
-        dragging = true
-        dragStart = input.Position
-        startPos = Main.Position
-
-        input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then
-                dragging = false
-            end
-        end)
-    end
-end)
-
-game:GetService("UserInputService").InputChanged:Connect(function(input)
-
-    if not dragging then
-        return
-    end
-
-    if input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch then
-
-        local delta = input.Position - dragStart
-
-        Main.Position = UDim2.new(
-            startPos.X.Scale,
-            startPos.X.Offset + delta.X,
-            startPos.Y.Scale,
-            startPos.Y.Offset + delta.Y
-        )
-    end
-end)
-
-print("RUBO Public Live Chat loaded.")
+Test()
