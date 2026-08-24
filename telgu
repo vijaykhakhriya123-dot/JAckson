@@ -1,981 +1,1576 @@
 --[[
-    RUBO — Social Interface v1.0
-    Single-file Roblox LocalScript
-    Main GUI: EXACTLY 400 x 350
+    NEXUS CHAT - FINAL UNIFIED SOURCE
+    ---------------------------------
+    This is one source file containing both sides of the system.
+
+    INSTALLATION:
+    1. Put this SAME file in ServerScriptService as a normal Script.
+    2. Put this SAME file in StarterPlayer > StarterPlayerScripts as a LocalScript.
+    3. Do not run the server copy as a LocalScript or the client copy as a Script.
+
+    The file automatically selects the correct side with RunService:IsServer().
+    No extra features are included beyond the supplied GUI/features/security design.
 ]]
 
---// Services
+local RunService = game:GetService("RunService")
+
+-- ========================================================================
+-- SERVER SIDE
+-- ========================================================================
+if RunService:IsServer() then
+    local Players = game:GetService("Players")
+    local TextService = game:GetService("TextService")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local HttpService = game:GetService("HttpService")
+
+    local CONFIG = {
+        MaxMessageLength = 250,
+        CooldownSeconds = 0.8,
+        MaxMessagesInWindow = 5,
+        RateLimitWindowSeconds = 5,
+        BurstPenaltySeconds = 15,
+        MaxReportsPerPlayer = 3,
+        MaxGlobalMessageHistory = 100,
+        MaxDMHistoryPerPair = 50,
+        MaxSecurityLogs = 200,
+        MaxNotesLength = 250,
+        AdminUserIds = {
+            -- [YOUR_USER_ID] = true,
+        },
+    }
+
+    local network = ReplicatedStorage:FindFirstChild("NexusChatNetwork")
+    if not network then
+        network = Instance.new("Folder")
+        network.Name = "NexusChatNetwork"
+        network.Parent = ReplicatedStorage
+    end
+
+    local function remote(className, name)
+        local old = network:FindFirstChild(name)
+        if old and old.ClassName == className then
+            return old
+        end
+        if old then old:Destroy() end
+        local obj = Instance.new(className)
+        obj.Name = name
+        obj.Parent = network
+        return obj
+    end
+
+    local Remotes = {
+        SendMessage = remote("RemoteFunction", "SendMessage"),
+        SendDM = remote("RemoteFunction", "SendDM"),
+        DeleteMessage = remote("RemoteFunction", "DeleteMessage"),
+        SubmitReport = remote("RemoteFunction", "SubmitReport"),
+        AddReaction = remote("RemoteEvent", "AddReaction"),
+        SendTyping = remote("RemoteEvent", "SendTyping"),
+        BroadcastMessage = remote("RemoteEvent", "BroadcastMessage"),
+        BroadcastDM = remote("RemoteEvent", "BroadcastDM"),
+        BroadcastReaction = remote("RemoteEvent", "BroadcastReaction"),
+        BroadcastTyping = remote("RemoteEvent", "BroadcastTyping"),
+        SystemNotification = remote("RemoteEvent", "SystemNotification"),
+    }
+
+    local State = {
+        Limits = {},
+        Messages = {},
+        DMSessions = {},
+        Logs = {},
+    }
+
+    local function log(player, severity, reason)
+        table.insert(State.Logs, 1, {
+            Time = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+            UserId = player and player.UserId or 0,
+            Name = player and player.Name or "SYSTEM",
+            Severity = severity,
+            Reason = tostring(reason),
+        })
+        if #State.Logs > CONFIG.MaxSecurityLogs then
+            table.remove(State.Logs)
+        end
+        if severity == "WARNING" or severity == "EXPLOIT_ATTEMPT" then
+            warn("[NEXUS SECURITY] " .. tostring(reason))
+        end
+    end
+
+    local function validPlayer(p)
+        return typeof(p) == "Instance" and p:IsA("Player") and p:IsDescendantOf(Players)
+    end
+
+    local function validString(v, minLen, maxLen)
+        return typeof(v) == "string" and #v >= minLen and #v <= maxLen
+    end
+
+    local function validNumber(v, minValue)
+        return typeof(v) == "number" and v == v and v >= minValue
+    end
+
+    local function tracker(p)
+        local id = p.UserId
+        if not State.Limits[id] then
+            State.Limits[id] = {
+                LastMessage = 0,
+                Requests = {},
+                MutedUntil = 0,
+                Reports = 0,
+                ReportReset = os.time(),
+                TypingAt = 0,
+            }
+        end
+        return State.Limits[id]
+    end
+
+    local function rateLimit(p)
+        local t = tracker(p)
+        local now = os.clock()
+
+        if now < t.MutedUntil then
+            return false, ("Rate limit active. Wait %d second(s)."):format(math.ceil(t.MutedUntil - now))
+        end
+
+        if now - t.LastMessage < CONFIG.CooldownSeconds then
+            log(p, "LOW", "Message cooldown violation")
+            return false, "Sending messages too fast."
+        end
+
+        for i = #t.Requests, 1, -1 do
+            if now - t.Requests[i] > CONFIG.RateLimitWindowSeconds then
+                table.remove(t.Requests, i)
+            end
+        end
+
+        table.insert(t.Requests, now)
+
+        if #t.Requests > CONFIG.MaxMessagesInWindow then
+            t.MutedUntil = now + CONFIG.BurstPenaltySeconds
+            log(p, "WARNING", "Message burst rate limit exceeded")
+            return false, ("Rate limit exceeded. Wait %d second(s)."):format(CONFIG.BurstPenaltySeconds)
+        end
+
+        t.LastMessage = now
+        return true
+    end
+
+    local function filterText(text, sender, recipient)
+        if not validString(text, 1, CONFIG.MaxMessageLength) then
+            return nil, "Message must be 1-" .. CONFIG.MaxMessageLength .. " characters."
+        end
+
+        local ok, result = pcall(function()
+            return TextService:FilterStringAsync(
+                text,
+                sender.UserId,
+                Enum.TextFilterContext.PublicChat
+            )
+        end)
+
+        if not ok or not result then
+            log(sender, "WARNING", "TextService filtering failed")
+            return nil, "Text processing failed."
+        end
+
+        local success, filtered = pcall(function()
+            if recipient then
+                return result:GetChatForUserAsync(recipient.UserId)
+            end
+            return result:GetNonChatStringForBroadcastAsync()
+        end)
+
+        if not success or not filtered then
+            log(sender, "WARNING", "Filtered text retrieval failed")
+            return nil, "Text moderation failed."
+        end
+
+        return filtered
+    end
+
+    local function isAdmin(p)
+        return validPlayer(p)
+            and (CONFIG.AdminUserIds[p.UserId] == true
+            or (game.CreatorType == Enum.CreatorType.User and p.UserId == game.CreatorId))
+    end
+
+    local function sessionKey(a, b)
+        a, b = tonumber(a), tonumber(b)
+        if a > b then a, b = b, a end
+        return ("%d_%d"):format(a, b)
+    end
+
+    local function registerMessage(data)
+        State.Messages[data.Id] = data
+
+        local ids = {}
+        for id, msg in pairs(State.Messages) do
+            table.insert(ids, {Id = id, Time = msg.Timestamp})
+        end
+
+        if #ids > CONFIG.MaxGlobalMessageHistory then
+            table.sort(ids, function(a, b) return a.Time < b.Time end)
+            for i = 1, #ids - CONFIG.MaxGlobalMessageHistory do
+                State.Messages[ids[i].Id] = nil
+            end
+        end
+    end
+
+    Remotes.SendMessage.OnServerInvoke = function(player, text, replyId)
+        if not validPlayer(player) then
+            return false, "Invalid player."
+        end
+
+        local allowed, reason = rateLimit(player)
+        if not allowed then return false, reason end
+
+        local reply
+        if replyId ~= nil and validString(replyId, 1, 100) then
+            local original = State.Messages[replyId]
+            if original and not original.IsDM then
+                reply = {
+                    Id = original.Id,
+                    SenderId = original.SenderId,
+                    SenderName = original.SenderDisplayName,
+                    Text = original.Text,
+                }
+            end
+        end
+
+        local filtered, err = filterText(text, player, nil)
+        if not filtered then return false, err end
+
+        local id = "MSG_" .. HttpService:GenerateGUID(false)
+        local payload = {
+            Id = id,
+            SenderId = player.UserId,
+            SenderDisplayName = player.DisplayName,
+            SenderUsername = player.Name,
+            Text = filtered,
+            Timestamp = os.time(),
+            IsDM = false,
+            ReplyTo = reply,
+        }
+
+        registerMessage(payload)
+        Remotes.BroadcastMessage:FireAllClients(payload)
+        return true, "Message sent."
+    end
+
+    Remotes.SendDM.OnServerInvoke = function(player, recipientId, text)
+        if not validPlayer(player) then return false, "Invalid player." end
+        if not validNumber(recipientId, 1) then return false, "Invalid recipient." end
+        if recipientId == player.UserId then return false, "You cannot DM yourself." end
+
+        local recipient = Players:GetPlayerByUserId(recipientId)
+        if not recipient then return false, "Player is not in this server." end
+
+        local allowed, reason = rateLimit(player)
+        if not allowed then return false, reason end
+
+        local filtered, err = filterText(text, player, recipient)
+        if not filtered then return false, err end
+
+        local key = sessionKey(player.UserId, recipient.UserId)
+        State.DMSessions[key] = State.DMSessions[key] or {}
+
+        local id = "DM_" .. HttpService:GenerateGUID(false)
+        local payload = {
+            Id = id,
+            SenderId = player.UserId,
+            SenderDisplayName = player.DisplayName,
+            SenderUsername = player.Name,
+            TargetId = recipient.UserId,
+            Text = filtered,
+            Timestamp = os.time(),
+            IsDM = true,
+        }
+
+        registerMessage(payload)
+        table.insert(State.DMSessions[key], payload)
+
+        while #State.DMSessions[key] > CONFIG.MaxDMHistoryPerPair do
+            table.remove(State.DMSessions[key], 1)
+        end
+
+        Remotes.BroadcastDM:FireClient(player, payload)
+        Remotes.BroadcastDM:FireClient(recipient, payload)
+        return true, "DM delivered."
+    end
+
+    Remotes.DeleteMessage.OnServerInvoke = function(player, id)
+        if not validPlayer(player) or not validString(id, 1, 100) then
+            return false, "Invalid request."
+        end
+
+        local msg = State.Messages[id]
+        if not msg then return false, "Message not found." end
+
+        if msg.SenderId ~= player.UserId and not isAdmin(player) then
+            log(player, "EXPLOIT_ATTEMPT", "Unauthorized message deletion")
+            return false, "Permission denied."
+        end
+
+        State.Messages[id] = nil
+        Remotes.BroadcastMessage:FireAllClients({Action = "Delete", Id = id})
+        return true, "Message deleted."
+    end
+
+    Remotes.AddReaction.OnServerEvent:Connect(function(player, id, emoji)
+        if not validPlayer(player) then return end
+        if not validString(id, 1, 100) or not validString(emoji, 1, 10) then return end
+
+        local allowed = {
+            ["❤️"] = true, ["👍"] = true, ["😂"] = true,
+            ["😮"] = true, ["😢"] = true, ["🔥"] = true,
+        }
+        if not allowed[emoji] then
+            log(player, "WARNING", "Unsupported reaction")
+            return
+        end
+
+        local msg = State.Messages[id]
+        if not msg then return end
+
+        msg.Reactions = msg.Reactions or {}
+        msg.Reactions[emoji] = (msg.Reactions[emoji] or 0) + 1
+
+        Remotes.BroadcastReaction:FireAllClients({
+            MessageId = id,
+            Emoji = emoji,
+            Count = msg.Reactions[emoji],
+        })
+    end)
+
+    Remotes.SubmitReport.OnServerInvoke = function(player, data)
+        if not validPlayer(player) or typeof(data) ~= "table" then
+            return false, "Invalid report."
+        end
+
+        local t = tracker(player)
+        local now = os.time()
+
+        if now - t.ReportReset >= 600 then
+            t.ReportReset = now
+            t.Reports = 0
+        end
+
+        if t.Reports >= CONFIG.MaxReportsPerPlayer then
+            return false, "Report limit reached. Please wait."
+        end
+
+        local target = data.TargetUserId
+        local reason = data.Reason
+        local notes = data.Notes or ""
+
+        if not validNumber(target, 1)
+            or not validString(reason, 1, 50)
+            or not validString(notes, 0, CONFIG.MaxNotesLength) then
+            log(player, "WARNING", "Malformed report payload")
+            return false, "Invalid report data."
+        end
+
+        t.Reports += 1
+        log(player, "WARNING",
+            ("Report filed against %d | %s | %s"):format(target, reason, notes))
+
+        return true, "Report submitted."
+    end
+
+    Remotes.SendTyping.OnServerEvent:Connect(function(player, isTyping)
+        if not validPlayer(player) or typeof(isTyping) ~= "boolean" then return end
+
+        local t = tracker(player)
+        local now = os.clock()
+
+        -- Allow the stop event immediately so indicators cannot get stuck.
+        if isTyping and now - t.TypingAt < 1 then return end
+        t.TypingAt = now
+
+        for _, other in ipairs(Players:GetPlayers()) do
+            if other ~= player then
+                Remotes.BroadcastTyping:FireClient(other, {
+                    UserId = player.UserId,
+                    DisplayName = player.DisplayName,
+                    IsTyping = isTyping,
+                })
+            end
+        end
+    end)
+
+    Players.PlayerRemoving:Connect(function(player)
+        State.Limits[player.UserId] = nil
+        for key in pairs(State.DMSessions) do
+            if key:find(tostring(player.UserId), 1, true) then
+                State.DMSessions[key] = nil
+            end
+        end
+    end)
+
+    task.spawn(function()
+        while true do
+            task.wait(900)
+            local cutoff = os.time() - 7200
+            for id, msg in pairs(State.Messages) do
+                if msg.Timestamp < cutoff then
+                    State.Messages[id] = nil
+                end
+            end
+        end
+    end)
+
+    print("[Nexus Chat] Server security/message gateway ready.")
+else
+
+-- ========================================================================
+-- CLIENT SIDE
+-- ========================================================================
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
-local StarterGui = game:GetService("StarterGui")
-local UserService = game:GetService("UserService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunServiceClient = game:GetService("RunService")
+local SoundService = game:GetService("SoundService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local Network = ReplicatedStorage:WaitForChild("NexusChatNetwork")
 
---// Cleanup previous RUBO
-local old = PlayerGui:FindFirstChild("RUBO_SocialInterface")
-if old then
-    old:Destroy()
+local Remotes = {
+    SendMessage = Network:WaitForChild("SendMessage"),
+    SendDM = Network:WaitForChild("SendDM"),
+    DeleteMessage = Network:WaitForChild("DeleteMessage"),
+    SubmitReport = Network:WaitForChild("SubmitReport"),
+    AddReaction = Network:WaitForChild("AddReaction"),
+    SendTyping = Network:WaitForChild("SendTyping"),
+    BroadcastMessage = Network:WaitForChild("BroadcastMessage"),
+    BroadcastDM = Network:WaitForChild("BroadcastDM"),
+    BroadcastReaction = Network:WaitForChild("BroadcastReaction"),
+    BroadcastTyping = Network:WaitForChild("BroadcastTyping"),
+    SystemNotification = Network:WaitForChild("SystemNotification"),
+}
+
+local CONFIG = {
+    Title = "NEXUS CHAT",
+    Subtitle = "Online • Secure Link",
+    MaxMessages = 100,
+    StartupTime = 1.8,
+    MobileWidth = 0.92,
+    DesktopWidth = 0.45,
+
+    Colors = {
+        Background = Color3.fromRGB(8, 10, 14),
+        Panel = Color3.fromRGB(14, 18, 26),
+        Header = Color3.fromRGB(10, 12, 18),
+        Input = Color3.fromRGB(12, 15, 22),
+        Primary = Color3.fromRGB(0, 170, 255),
+        Secondary = Color3.fromRGB(0, 85, 170),
+        Glow = Color3.fromRGB(0, 195, 255),
+        Text = Color3.fromRGB(245, 248, 255),
+        Muted = Color3.fromRGB(120, 135, 160),
+        UserBubble = Color3.fromRGB(16, 30, 48),
+        OtherBubble = Color3.fromRGB(18, 22, 32),
+        UserBorder = Color3.fromRGB(0, 140, 220),
+        OtherBorder = Color3.fromRGB(35, 45, 60),
+        Red = Color3.fromRGB(210, 60, 60),
+        Green = Color3.fromRGB(40, 200, 120),
+    },
+
+    Reactions = {"❤️", "👍", "😂", "😮", "😢", "🔥"},
+}
+
+local State = {
+    Open = true,
+    Minimized = false,
+    Tab = "Chat",
+    DMTarget = nil,
+    Reply = nil,
+    Muted = {},
+    Settings = {
+        Glow = true,
+        Animations = true,
+        Notifications = true,
+        Timestamps = true,
+        AutoScroll = true,
+        Sound = true,
+        Typing = true,
+    },
+    Messages = {},
+    MessageById = {},
+    Connections = {},
+    Unread = 0,
+    TypingSent = false,
+}
+
+local function create(className, props, children)
+    local x = Instance.new(className)
+    for k, v in pairs(props or {}) do x[k] = v end
+    for _, child in ipairs(children or {}) do child.Parent = x end
+    return x
 end
 
---// Theme
-local BLUE = Color3.fromRGB(40, 150, 255)
-local LIGHT_BLUE = Color3.fromRGB(120, 205, 255)
-local WHITE = Color3.fromRGB(245, 250, 255)
-local TEXT = Color3.fromRGB(220, 235, 250)
-local MUTED = Color3.fromRGB(145, 175, 200)
-local DARK = Color3.fromRGB(5, 15, 28)
-local PANEL = Color3.fromRGB(10, 35, 60)
-local GREEN = Color3.fromRGB(80, 220, 145)
-local RED = Color3.fromRGB(255, 100, 110)
-
-local MAIN_SIZE = Vector2.new(400, 350)
-
---// Local State
-local followedUsers = {}
-
---// Helpers
-local function corner(obj, radius)
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, radius or 8)
-    c.Parent = obj
-    return c
+local function corner(radius)
+    return create("UICorner", {CornerRadius = UDim.new(0, radius)})
 end
 
-local function stroke(obj, color, transparency, thickness)
-    local s = Instance.new("UIStroke")
-    s.Color = color or BLUE
-    s.Transparency = transparency or 0.45
-    s.Thickness = thickness or 1
-    s.Parent = obj
-    return s
+local function stroke(color, thickness, transparency)
+    return create("UIStroke", {
+        Color = color,
+        Thickness = thickness or 1,
+        Transparency = transparency or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    })
 end
 
-local function tween(obj, info, props)
-    local t = TweenService:Create(obj, info, props)
+local function tween(obj, time, props, style, direction)
+    if not State.Settings.Animations then
+        for k, v in pairs(props) do obj[k] = v end
+        return
+    end
+    local t = TweenService:Create(
+        obj,
+        TweenInfo.new(time or 0.2, style or Enum.EasingStyle.Quart, direction or Enum.EasingDirection.Out),
+        props
+    )
     t:Play()
     return t
 end
 
-local function new(class, props, parent)
-    local obj = Instance.new(class)
-    for k, v in pairs(props or {}) do
-        obj[k] = v
-    end
-    obj.Parent = parent
-    return obj
-end
-
 local function notify(text)
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title = "RUBO",
+    if not State.Settings.Notifications then return end
+
+    local toast = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 30),
+        BackgroundColor3 = CONFIG.Colors.Panel,
+        BackgroundTransparency = 0.08,
+        Parent = ToastHolder,
+    }, {
+        corner(7),
+        stroke(CONFIG.Colors.Primary, 1),
+        create("TextLabel", {
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
+            TextColor3 = CONFIG.Colors.Text,
             Text = text,
-            Duration = 3
-        })
-    end)
-end
-
-local function avatar(userId, size)
-    local ok, image = pcall(function()
-        return Players:GetUserThumbnailAsync(
-            userId,
-            Enum.ThumbnailType.HeadShot,
-            size or Enum.ThumbnailSize.Size100x100
-        )
-    end)
-
-    return ok and image or ""
-end
-
-local function safeUserId(username)
-    local ok, id = pcall(function()
-        return Players:GetUserIdFromNameAsync(username)
-    end)
-
-    if ok then
-        return id
-    end
-
-    return nil
-end
-
-local function setupFollowButton(btn, userId, getUsernameFunc)
-    local function updateState()
-        local isFollowing = followedUsers[userId] or false
-        if isFollowing then
-            btn.Text = "Following"
-            btn.TextColor3 = GREEN
-        else
-            btn.Text = "Follow"
-            btn.TextColor3 = WHITE
-        end
-    end
-
-    updateState()
-
-    btn.Activated:Connect(function()
-        followedUsers[userId] = not followedUsers[userId]
-        local isFollowing = followedUsers[userId]
-        updateState()
-        
-        local uname = getUsernameFunc and getUsernameFunc() or "User"
-        if isFollowing then
-            notify("Followed @" .. uname)
-        else
-            notify("Unfollowed @" .. uname)
-        end
-    end)
-end
-
---// ScreenGui
-local gui = new("ScreenGui", {
-    Name = "RUBO_SocialInterface",
-    ResetOnSpawn = false,
-    IgnoreGuiInset = true,
-    ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-}, PlayerGui)
-
---// Main Window
-local main = new("Frame", {
-    Name = "Main",
-    Size = UDim2.fromOffset(400, 350),
-    Position = UDim2.new(0.5, -200, 0.5, -175),
-    BackgroundColor3 = DARK,
-    BackgroundTransparency = 0.16,
-    BorderSizePixel = 0,
-    ClipsDescendants = true
-}, gui)
-
-corner(main, 12)
-stroke(main, BLUE, 0.35, 1)
-
---// Gradient
-local gradient = new("UIGradient", {
-    Rotation = 125,
-    Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(8, 30, 55)),
-        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(7, 22, 40)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(4, 12, 23))
-    }),
-    Transparency = NumberSequence.new({
-        NumberSequenceKeypoint.new(0, 0.12),
-        NumberSequenceKeypoint.new(1, 0.32)
+        }),
     })
-}, main)
 
---// Header
-local header = new("Frame", {
-    Size = UDim2.new(1, 0, 0, 48),
+    task.delay(2.5, function()
+        if toast.Parent then
+            local t = tween(toast, 0.2, {BackgroundTransparency = 1})
+            if t then t.Completed:Wait() end
+            toast:Destroy()
+        end
+    end)
+end
+
+local oldGui = PlayerGui:FindFirstChild("NexusChatFinal")
+if oldGui then oldGui:Destroy() end
+
+local ScreenGui = create("ScreenGui", {
+    Name = "NexusChatFinal",
+    ResetOnSpawn = false,
+    DisplayOrder = 100,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    Parent = PlayerGui,
+})
+
+local Startup = create("Frame", {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = CONFIG.Colors.Background,
+    ZIndex = 200,
+    Parent = ScreenGui,
+})
+
+local StartupTitle = create("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 40),
+    Position = UDim2.fromScale(0.5, 0.45),
+    AnchorPoint = Vector2.new(0.5, 0.5),
     BackgroundTransparency = 1,
-    BorderSizePixel = 0
-}, main)
+    Text = CONFIG.Title,
+    TextColor3 = CONFIG.Colors.Text,
+    TextTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    TextSize = 30,
+    Parent = Startup,
+}, {stroke(CONFIG.Colors.Glow, 2, 1)})
 
-local brand = new("TextLabel", {
-    Position = UDim2.fromOffset(15, 7),
-    Size = UDim2.fromOffset(110, 22),
+local StartupSub = create("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 20),
+    Position = UDim2.fromScale(0.5, 0.52),
+    AnchorPoint = Vector2.new(0.5, 0.5),
     BackgroundTransparency = 1,
-    Text = "RUBO",
-    Font = Enum.Font.GothamBold,
-    TextSize = 20,
-    TextColor3 = WHITE,
-    TextXAlignment = Enum.TextXAlignment.Left
-}, header)
+    Text = "Initializing Link Protocol...",
+    TextColor3 = CONFIG.Colors.Primary,
+    TextTransparency = 1,
+    Font = Enum.Font.Code,
+    TextSize = 12,
+    Parent = Startup,
+})
 
-local subtitle = new("TextLabel", {
-    Position = UDim2.fromOffset(16, 27),
-    Size = UDim2.fromOffset(130, 16),
+local Progress = create("Frame", {
+    Size = UDim2.new(0, 220, 0, 4),
+    Position = UDim2.fromScale(0.5, 0.58),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = CONFIG.Colors.OtherBubble,
     BackgroundTransparency = 1,
-    Text = "Social Interface",
-    Font = Enum.Font.Gotham,
-    TextSize = 9,
-    TextColor3 = LIGHT_BLUE,
-    TextXAlignment = Enum.TextXAlignment.Left
-}, header)
-
-local minimize = new("TextButton", {
-    Position = UDim2.new(1, -58, 0, 10),
-    Size = UDim2.fromOffset(22, 22),
-    BackgroundColor3 = PANEL,
-    BackgroundTransparency = 0.25,
-    Text = "—",
-    Font = Enum.Font.GothamBold,
-    TextSize = 15,
-    TextColor3 = WHITE,
-    AutoButtonColor = false
-}, header)
-
-corner(minimize, 6)
-stroke(minimize, BLUE, 0.55)
-
-local close = new("TextButton", {
-    Position = UDim2.new(1, -31, 0, 10),
-    Size = UDim2.fromOffset(22, 22),
-    BackgroundColor3 = PANEL,
-    BackgroundTransparency = 0.25,
-    Text = "×",
-    Font = Enum.Font.GothamBold,
-    TextSize = 17,
-    TextColor3 = WHITE,
-    AutoButtonColor = false
-}, header)
-
-corner(close, 6)
-stroke(close, BLUE, 0.55)
-
---// Tab Navigation
-local tabBar = new("ScrollingFrame", {
-    Position = UDim2.fromOffset(8, 49),
-    Size = UDim2.new(1, -16, 0, 34),
-    BackgroundColor3 = PANEL,
-    BackgroundTransparency = 0.55,
     BorderSizePixel = 0,
-    ScrollBarThickness = 2,
-    ScrollBarImageColor3 = BLUE,
-    CanvasSize = UDim2.fromOffset(0, 0),
-    AutomaticCanvasSize = Enum.AutomaticSize.X,
-    ScrollingDirection = Enum.ScrollingDirection.X
-}, main)
+    Parent = Startup,
+}, {corner(4)})
 
-corner(tabBar, 8)
+local Fill = create("Frame", {
+    Size = UDim2.new(0, 0, 1, 0),
+    BackgroundColor3 = CONFIG.Colors.Primary,
+    BorderSizePixel = 0,
+    Parent = Progress,
+}, {corner(4)})
 
-local tabLayout = new("UIListLayout", {
-    FillDirection = Enum.FillDirection.Horizontal,
-    Padding = UDim.new(0, 4),
-    VerticalAlignment = Enum.VerticalAlignment.Center
-}, tabBar)
+local touch = UserInputService.TouchEnabled
 
-new("UIPadding", {
-    PaddingLeft = UDim.new(0, 5),
-    PaddingRight = UDim.new(0, 5)
-}, tabBar)
+local Main = create("Frame", {
+    Name = "MainChatWindow",
+    Size = touch and UDim2.new(CONFIG.MobileWidth, 0, 0.55, 0)
+        or UDim2.new(CONFIG.DesktopWidth, 0, 0.58, 0),
+    Position = touch and UDim2.new(0.5, 0, 0.05, 0)
+        or UDim2.new(0.02, 0, 0.15, 0),
+    AnchorPoint = touch and Vector2.new(0.5, 0) or Vector2.new(0, 0),
+    BackgroundColor3 = CONFIG.Colors.Panel,
+    BackgroundTransparency = 0.12,
+    Visible = false,
+    Parent = ScreenGui,
+}, {
+    corner(12),
+    stroke(CONFIG.Colors.Secondary, 1.5, 0.25),
+    create("UISizeConstraint", {
+        MinSize = Vector2.new(290, 260),
+        MaxSize = Vector2.new(850, 680),
+    }),
+})
 
---// Content
-local content = new("Frame", {
-    Position = UDim2.fromOffset(8, 88),
-    Size = UDim2.new(1, -16, 1, -96),
+local Glow = create("ImageLabel", {
+    Size = UDim2.new(1, 40, 1, 40),
+    Position = UDim2.fromScale(0.5, 0.5),
+    AnchorPoint = Vector2.new(0.5, 0.5),
     BackgroundTransparency = 1,
-    ClipsDescendants = true
-}, main)
+    Image = "rbxassetid://5028857472",
+    ImageColor3 = CONFIG.Colors.Glow,
+    ImageTransparency = 0.82,
+    ZIndex = 0,
+    Parent = Main,
+})
 
---// Pages
-local pages = {}
+local Header = create("Frame", {
+    Size = UDim2.new(1, 0, 0, 44),
+    BackgroundColor3 = CONFIG.Colors.Header,
+    Parent = Main,
+}, {corner(12)})
 
-local function createPage(name)
-    local page = new("ScrollingFrame", {
+create("Frame", {
+    Size = UDim2.new(0, 8, 0, 8),
+    Position = UDim2.new(0, 14, 0.5, -4),
+    BackgroundColor3 = CONFIG.Colors.Green,
+    Parent = Header,
+}, {corner(4)})
+
+create("TextLabel", {
+    Size = UDim2.new(0.5, 0, 0, 18),
+    Position = UDim2.new(0, 34, 0, 4),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    TextColor3 = CONFIG.Colors.Text,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Text = CONFIG.Title,
+    Parent = Header,
+})
+
+create("TextLabel", {
+    Size = UDim2.new(0.5, 0, 0, 14),
+    Position = UDim2.new(0, 34, 0, 22),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham,
+    TextSize = 10,
+    TextColor3 = CONFIG.Colors.Muted,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Text = CONFIG.Subtitle,
+    Parent = Header,
+})
+
+local Controls = create("Frame", {
+    Size = UDim2.new(0, 100, 1, 0),
+    Position = UDim2.new(1, -8, 0, 0),
+    AnchorPoint = Vector2.new(1, 0),
+    BackgroundTransparency = 1,
+    Parent = Header,
+}, {
+    create("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        HorizontalAlignment = Enum.HorizontalAlignment.Right,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        Padding = UDim.new(0, 6),
+    }),
+})
+
+local function headerButton(name, text)
+    local b = create("TextButton", {
         Name = name,
-        Size = UDim2.fromScale(1, 1),
-        BackgroundTransparency = 1,
-        BorderSizePixel = 0,
-        ScrollBarThickness = 3,
-        ScrollBarImageColor3 = BLUE,
-        CanvasSize = UDim2.new(0, 0, 0, 0),
-        AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        Visible = false
-    }, content)
-
-    pages[name] = page
-    return page
-end
-
-local function label(parent, text, pos, size, textSize, color)
-    return new("TextLabel", {
-        Position = pos,
-        Size = size,
-        BackgroundTransparency = 1,
+        Size = UDim2.new(0, 26, 0, 26),
+        BackgroundColor3 = CONFIG.Colors.OtherBubble,
         Text = text,
-        Font = Enum.Font.Gotham,
-        TextSize = textSize or 12,
-        TextColor3 = color or TEXT,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextYAlignment = Enum.TextYAlignment.Center
-    }, parent)
-end
-
-local function button(parent, text, pos, size)
-    local b = new("TextButton", {
-        Position = pos,
-        Size = size,
-        BackgroundColor3 = PANEL,
-        BackgroundTransparency = 0.22,
-        BorderSizePixel = 0,
-        Text = text,
-        Font = Enum.Font.GothamSemibold,
-        TextSize = 11,
-        TextColor3 = WHITE,
-        AutoButtonColor = false
-    }, parent)
-
-    corner(b, 7)
-    stroke(b, BLUE, 0.58)
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextColor3 = CONFIG.Colors.Muted,
+        AutoButtonColor = false,
+        Parent = Controls,
+    }, {corner(6), stroke(CONFIG.Colors.OtherBorder, 1)})
 
     b.MouseEnter:Connect(function()
-        tween(b, TweenInfo.new(0.15), {
-            BackgroundTransparency = 0.02
+        tween(b, 0.12, {
+            BackgroundColor3 = CONFIG.Colors.Secondary,
+            TextColor3 = CONFIG.Colors.Text,
         })
     end)
 
     b.MouseLeave:Connect(function()
-        tween(b, TweenInfo.new(0.15), {
-            BackgroundTransparency = 0.22
+        tween(b, 0.12, {
+            BackgroundColor3 = CONFIG.Colors.OtherBubble,
+            TextColor3 = CONFIG.Colors.Muted,
         })
-    end)
-
-    b.Activated:Connect(function()
-        tween(b, TweenInfo.new(0.08), {
-            Size = UDim2.new(size.X.Scale, size.X.Offset - 2, size.Y.Scale, size.Y.Offset - 2)
-        })
-
-        task.delay(0.08, function()
-            if b.Parent then
-                tween(b, TweenInfo.new(0.08), {
-                    Size = size
-                })
-            end
-        end)
     end)
 
     return b
 end
 
-local function panel(parent, pos, size)
-    local p = new("Frame", {
-        Position = pos,
-        Size = size,
-        BackgroundColor3 = PANEL,
-        BackgroundTransparency = 0.48,
-        BorderSizePixel = 0
-    }, parent)
+local SettingsButton = headerButton("SettingsButton", "⚙")
+local MinimizeButton = headerButton("MinimizeButton", "─")
+local CloseButton = headerButton("CloseButton", "✕")
 
-    corner(p, 9)
-    stroke(p, BLUE, 0.72)
+local Body = create("Frame", {
+    Size = UDim2.new(1, 0, 1, -44),
+    Position = UDim2.new(0, 0, 0, 44),
+    BackgroundTransparency = 1,
+    Parent = Main,
+})
 
-    return p
+local Sidebar = create("Frame", {
+    Size = UDim2.new(0, 48, 1, -8),
+    Position = UDim2.new(0, 6, 0, 4),
+    BackgroundColor3 = CONFIG.Colors.Header,
+    Parent = Body,
+}, {
+    corner(8),
+    create("UIPadding", {
+        PaddingTop = UDim.new(0, 6),
+        PaddingBottom = UDim.new(0, 6),
+    }),
+    create("UIListLayout", {
+        FillDirection = Enum.FillDirection.Vertical,
+        HorizontalAlignment = Enum.HorizontalAlignment.Center,
+        Padding = UDim.new(0, 8),
+    }),
+})
+
+local function tabButton(name, icon)
+    return create("TextButton", {
+        Name = name,
+        Size = UDim2.new(0, 36, 0, 36),
+        BackgroundColor3 = CONFIG.Colors.OtherBubble,
+        Text = icon,
+        Font = Enum.Font.GothamBold,
+        TextSize = 14,
+        TextColor3 = CONFIG.Colors.Muted,
+        AutoButtonColor = false,
+        Parent = Sidebar,
+    }, {corner(8), stroke(CONFIG.Colors.OtherBorder, 1)})
 end
 
---========================================================
--- CHAT (FIRST TAB)
---========================================================
-local chat = createPage("Chat")
+local ChatTab = tabButton("ChatTab", "💬")
+local PlayersTab = tabButton("PlayersTab", "👥")
 
-label(chat, "SESSION CHAT", UDim2.fromOffset(10, 7), UDim2.fromOffset(280, 22), 16, WHITE)
-label(chat, "Local session messaging", UDim2.fromOffset(10, 30), UDim2.fromOffset(350, 18), 9, MUTED)
+local ChatView = create("Frame", {
+    Size = UDim2.new(1, -66, 1, -10),
+    Position = UDim2.new(0, 60, 0, 4),
+    BackgroundTransparency = 1,
+    Parent = Body,
+})
 
-local chatBoxFrame = panel(chat, UDim2.fromOffset(8, 50), UDim2.new(1, -16, 0, 155))
-
-local chatScroll = new("ScrollingFrame", {
-    Position = UDim2.fromOffset(6, 6),
-    Size = UDim2.new(1, -12, 1, -12),
+local MessageScroll = create("ScrollingFrame", {
+    Name = "MessageContainer",
+    Size = UDim2.new(1, 0, 1, -58),
     BackgroundTransparency = 1,
     BorderSizePixel = 0,
+    CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
     ScrollBarThickness = 2,
-    ScrollBarImageColor3 = BLUE,
-    CanvasSize = UDim2.new(0, 0, 0, 0),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y
-}, chatBoxFrame)
+    ScrollBarImageColor3 = CONFIG.Colors.Primary,
+    Parent = ChatView,
+}, {
+    create("UIPadding", {
+        PaddingTop = UDim.new(0, 4),
+        PaddingBottom = UDim.new(0, 6),
+        PaddingLeft = UDim.new(0, 3),
+        PaddingRight = UDim.new(0, 3),
+    }),
+    create("UIListLayout", {
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 6),
+    }),
+})
 
-local chatLayout = new("UIListLayout", {
-    Padding = UDim.new(0, 4),
-    SortOrder = Enum.SortOrder.LayoutOrder
-}, chatScroll)
+local InputContainer = create("Frame", {
+    Name = "InputContainer",
+    Size = UDim2.new(1, 0, 0, 38),
+    Position = UDim2.new(0, 0, 1, 0),
+    AnchorPoint = Vector2.new(0, 1),
+    BackgroundColor3 = CONFIG.Colors.Input,
+    Parent = ChatView,
+}, {corner(8), stroke(CONFIG.Colors.OtherBorder, 1)})
 
-local chatInputBox = new("TextBox", {
-    Position = UDim2.fromOffset(8, 212),
-    Size = UDim2.new(1, -96, 0, 34),
-    BackgroundColor3 = PANEL,
-    BackgroundTransparency = 0.25,
-    BorderSizePixel = 0,
-    PlaceholderText = "Type a message...",
-    PlaceholderColor3 = MUTED,
-    Text = "",
+local MessageInput = create("TextBox", {
+    Name = "MessageInput",
+    Size = UDim2.new(1, -48, 1, 0),
+    Position = UDim2.new(0, 10, 0, 0),
+    BackgroundTransparency = 1,
+    ClearTextOnFocus = false,
     Font = Enum.Font.Gotham,
+    TextSize = 13,
+    TextColor3 = CONFIG.Colors.Text,
+    PlaceholderColor3 = CONFIG.Colors.Muted,
+    PlaceholderText = "Type a message...",
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = InputContainer,
+})
+
+local SendButton = create("TextButton", {
+    Name = "SendBtn",
+    Size = UDim2.new(0, 28, 0, 28),
+    Position = UDim2.new(1, -5, 0.5, 0),
+    AnchorPoint = Vector2.new(1, 0.5),
+    BackgroundColor3 = CONFIG.Colors.Primary,
+    Text = "➤",
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextColor3 = CONFIG.Colors.Text,
+    AutoButtonColor = false,
+    Parent = InputContainer,
+}, {corner(6)})
+
+local TypingLabel = create("TextLabel", {
+    Size = UDim2.new(1, -8, 0, 14),
+    Position = UDim2.new(0, 4, 1, -54),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamItalic,
+    TextSize = 10,
+    TextColor3 = CONFIG.Colors.Primary,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Visible = false,
+    Parent = ChatView,
+})
+
+local ReplyBar = create("Frame", {
+    Size = UDim2.new(1, 0, 0, 24),
+    Position = UDim2.new(0, 0, 0, -26),
+    BackgroundColor3 = CONFIG.Colors.Panel,
+    Visible = false,
+    Parent = InputContainer,
+}, {corner(6), stroke(CONFIG.Colors.Primary, 1)})
+
+local ReplyText = create("TextLabel", {
+    Size = UDim2.new(1, -26, 1, 0),
+    Position = UDim2.new(0, 8, 0, 0),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham,
+    TextSize = 10,
+    TextColor3 = CONFIG.Colors.Muted,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+    Parent = ReplyBar,
+})
+
+local CancelReply = create("TextButton", {
+    Size = UDim2.new(0, 20, 0, 20),
+    Position = UDim2.new(1, -2, 0.5, 0),
+    AnchorPoint = Vector2.new(1, 0.5),
+    BackgroundTransparency = 1,
+    Text = "✕",
+    Font = Enum.Font.GothamBold,
     TextSize = 11,
-    TextColor3 = WHITE,
-    ClearTextOnFocus = false
-}, chat)
+    TextColor3 = CONFIG.Colors.Red,
+    Parent = ReplyBar,
+})
 
-corner(chatInputBox, 7)
-stroke(chatInputBox, BLUE, 0.62)
+local SettingsMenu = create("Frame", {
+    Size = UDim2.new(0, 200, 0, 220),
+    Position = UDim2.new(1, -8, 0, 48),
+    AnchorPoint = Vector2.new(1, 0),
+    BackgroundColor3 = CONFIG.Colors.Background,
+    Visible = false,
+    ZIndex = 100,
+    Parent = Main,
+}, {
+    corner(8),
+    stroke(CONFIG.Colors.Secondary, 1),
+    create("UIPadding", {
+        PaddingTop = UDim.new(0, 10),
+        PaddingBottom = UDim.new(0, 10),
+        PaddingLeft = UDim.new(0, 10),
+        PaddingRight = UDim.new(0, 10),
+    }),
+    create("UIListLayout", {
+        Padding = UDim.new(0, 6),
+        HorizontalAlignment = Enum.HorizontalAlignment.Center,
+    }),
+})
 
-local sendBtn = button(chat, "Send", UDim2.new(1, -80, 0, 212), UDim2.fromOffset(72, 34))
+local function setting(name, key)
+    local b = create("TextButton", {
+        Size = UDim2.new(1, 0, 0, 26),
+        BackgroundColor3 = CONFIG.Colors.OtherBubble,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextColor3 = CONFIG.Colors.Text,
+        AutoButtonColor = false,
+        Parent = SettingsMenu,
+    }, {corner(5)})
 
-local msgCount = 0
-local function addChatMessage(senderName, text)
-    msgCount = msgCount + 1
+    local function refresh()
+        b.Text = name .. ": " .. (State.Settings[key] and "ON" or "OFF")
+        b.BackgroundColor3 = State.Settings[key] and CONFIG.Colors.Secondary or CONFIG.Colors.OtherBubble
+    end
 
-    local msgRow = new("Frame", {
+    b.MouseButton1Click:Connect(function()
+        State.Settings[key] = not State.Settings[key]
+        refresh()
+        if key == "Glow" then Glow.Visible = State.Settings.Glow end
+    end)
+
+    refresh()
+end
+
+setting("Neon Glow", "Glow")
+setting("Animations", "Animations")
+setting("Notifications", "Notifications")
+setting("Timestamps", "Timestamps")
+setting("Auto Scroll", "AutoScroll")
+setting("Sound", "Sound")
+setting("Typing Indicator", "Typing")
+
+local Reopen = create("TextButton", {
+    Size = UDim2.new(0, 80, 0, 32),
+    Position = UDim2.new(0, 15, 0.5, -16),
+    BackgroundColor3 = CONFIG.Colors.Panel,
+    Text = "CHAT",
+    Font = Enum.Font.GothamBold,
+    TextSize = 12,
+    TextColor3 = CONFIG.Colors.Primary,
+    Visible = false,
+    Parent = ScreenGui,
+}, {corner(16), stroke(CONFIG.Colors.Primary, 1.5)})
+
+local UnreadBadge = create("TextLabel", {
+    Size = UDim2.new(0, 18, 0, 18),
+    Position = UDim2.new(1, -2, 0, -4),
+    BackgroundColor3 = CONFIG.Colors.Primary,
+    Text = "0",
+    Font = Enum.Font.GothamBold,
+    TextSize = 10,
+    TextColor3 = CONFIG.Colors.Text,
+    Visible = false,
+    Parent = Reopen,
+}, {corner(9)})
+
+local ToastHolder = create("Frame", {
+    Size = UDim2.new(0, 230, 0, 120),
+    Position = UDim2.new(0.5, 0, 0.02, 0),
+    AnchorPoint = Vector2.new(0.5, 0),
+    BackgroundTransparency = 1,
+    Parent = ScreenGui,
+}, {
+    create("UIListLayout", {
+        Padding = UDim.new(0, 5),
+        HorizontalAlignment = Enum.HorizontalAlignment.Center,
+    }),
+})
+
+local PlayersPanel = create("Frame", {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = CONFIG.Colors.Panel,
+    Visible = false,
+    Parent = ChatView,
+}, {corner(8)})
+
+local PlayerSearch = create("TextBox", {
+    Size = UDim2.new(1, -16, 0, 32),
+    Position = UDim2.new(0, 8, 0, 8),
+    BackgroundColor3 = CONFIG.Colors.Background,
+    Font = Enum.Font.Gotham,
+    TextSize = 12,
+    TextColor3 = CONFIG.Colors.Text,
+    PlaceholderColor3 = CONFIG.Colors.Muted,
+    PlaceholderText = "Search players...",
+    ClearTextOnFocus = false,
+    Parent = PlayersPanel,
+}, {corner(6), stroke(CONFIG.Colors.Secondary, 1), create("UIPadding", {PaddingLeft = UDim.new(0, 8)})})
+
+local PlayerScroll = create("ScrollingFrame", {
+    Size = UDim2.new(1, -16, 1, -50),
+    Position = UDim2.new(0, 8, 0, 44),
+    BackgroundTransparency = 1,
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    ScrollBarThickness = 2,
+    ScrollBarImageColor3 = CONFIG.Colors.Primary,
+    Parent = PlayersPanel,
+}, {
+    create("UIListLayout", {Padding = UDim.new(0, 5)}),
+})
+
+local DMHeader = create("Frame", {
+    Size = UDim2.new(1, 0, 0, 28),
+    BackgroundColor3 = CONFIG.Colors.Header,
+    Visible = false,
+    Parent = ChatView,
+}, {corner(6)})
+
+local DMBack = create("TextButton", {
+    Size = UDim2.new(0, 60, 1, 0),
+    BackgroundTransparency = 1,
+    Text = "◄ Back",
+    Font = Enum.Font.GothamBold,
+    TextSize = 11,
+    TextColor3 = CONFIG.Colors.Primary,
+    Parent = DMHeader,
+})
+
+local DMTitle = create("TextLabel", {
+    Size = UDim2.new(1, -70, 1, 0),
+    Position = UDim2.new(0, 65, 0, 0),
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    TextSize = 11,
+    TextColor3 = CONFIG.Colors.Text,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Text = "Direct Conversation",
+    Parent = DMHeader,
+})
+
+local function clearChildren(container, keep)
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("GuiObject") and child ~= keep then child:Destroy() end
+    end
+end
+
+local function setReply(data)
+    State.Reply = data
+    if data then
+        ReplyBar.Visible = true
+        ReplyText.Text = "Replying to " .. tostring(data.SenderName) .. ": " .. tostring(data.Text)
+    else
+        ReplyBar.Visible = false
+        ReplyText.Text = ""
+    end
+end
+
+CancelReply.MouseButton1Click:Connect(function() setReply(nil) end)
+
+local function playMessageSound()
+    if not State.Settings.Sound then return end
+    local sound = Instance.new("Sound")
+    sound.SoundId = "rbxassetid://6026982404"
+    sound.Volume = 0.25
+    sound.Parent = SoundService
+    sound:Play()
+    sound.Ended:Connect(function() sound:Destroy() end)
+end
+
+local function addMessage(payload, isDM)
+    if not payload or State.Muted[payload.SenderId] then return end
+
+    local isSelf = payload.SenderId == LocalPlayer.UserId
+
+    local holder = create("Frame", {
         Size = UDim2.new(1, 0, 0, 0),
         AutomaticSize = Enum.AutomaticSize.Y,
         BackgroundTransparency = 1,
-        LayoutOrder = msgCount
-    }, chatScroll)
+        Parent = MessageScroll,
+    })
 
-    local msgText = new("TextLabel", {
-        Size = UDim2.new(1, 0, 0, 0),
+    local bubble = create("Frame", {
+        Size = UDim2.new(0.88, 0, 0, 0),
         AutomaticSize = Enum.AutomaticSize.Y,
+        Position = isSelf and UDim2.new(1, 0, 0, 0) or UDim2.new(0, 0, 0, 0),
+        AnchorPoint = isSelf and Vector2.new(1, 0) or Vector2.new(0, 0),
+        BackgroundColor3 = isSelf and CONFIG.Colors.UserBubble or CONFIG.Colors.OtherBubble,
+        Parent = holder,
+    }, {
+        corner(8),
+        stroke(isSelf and CONFIG.Colors.UserBorder or CONFIG.Colors.OtherBorder, 1),
+        create("UIPadding", {
+            PaddingTop = UDim.new(0, 6),
+            PaddingBottom = UDim.new(0, 6),
+            PaddingLeft = UDim.new(0, 8),
+            PaddingRight = UDim.new(0, 8),
+        }),
+    })
+
+    local meta = payload.SenderDisplayName or payload.SenderUsername or "Player"
+    if State.Settings.Timestamps and payload.Timestamp then
+        meta = meta .. " [" .. os.date("%H:%M", payload.Timestamp) .. "]"
+    end
+    if isDM then meta = "DM • " .. meta end
+
+    create("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 14),
         BackgroundTransparency = 1,
-        Text = "<b>" .. senderName .. ":</b> " .. text,
-        RichText = true,
-        Font = Enum.Font.Gotham,
-        TextSize = 10,
-        TextColor3 = TEXT,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextColor3 = isSelf and CONFIG.Colors.Primary or CONFIG.Colors.Text,
         TextXAlignment = Enum.TextXAlignment.Left,
-        TextWrapped = true
-    }, msgRow)
+        Text = meta,
+        Parent = bubble,
+    })
+
+    local body = create("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 0),
+        Position = UDim2.new(0, 0, 0, 16),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        TextSize = 12,
+        TextColor3 = CONFIG.Colors.Text,
+        TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = payload.Text or "",
+        Parent = bubble,
+    })
+
+    if payload.ReplyTo then
+        create("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 14),
+            Position = UDim2.new(0, 0, 0, 32),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamItalic,
+            TextSize = 9,
+            TextColor3 = CONFIG.Colors.Muted,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Text = "↳ " .. tostring(payload.ReplyTo.SenderName) .. ": " .. tostring(payload.ReplyTo.Text),
+            Parent = bubble,
+        })
+    end
+
+    local actions = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 22),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        Position = UDim2.new(0, 0, 1, 4),
+        BackgroundTransparency = 1,
+        Parent = bubble,
+    }, {
+        create("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal,
+            Padding = UDim.new(0, 4),
+        }),
+    })
+
+    local replyBtn = create("TextButton", {
+        Size = UDim2.new(0, 48, 0, 20),
+        BackgroundColor3 = CONFIG.Colors.Background,
+        Text = "Reply",
+        Font = Enum.Font.GothamMedium,
+        TextSize = 9,
+        TextColor3 = CONFIG.Colors.Muted,
+        Parent = actions,
+    }, {corner(4)})
+
+    replyBtn.MouseButton1Click:Connect(function()
+        setReply({
+            Id = payload.Id,
+            SenderName = payload.SenderDisplayName,
+            Text = payload.Text,
+        })
+        MessageInput:CaptureFocus()
+    end)
+
+    for _, emoji in ipairs(CONFIG.Reactions) do
+        local rb = create("TextButton", {
+            Size = UDim2.new(0, 24, 0, 20),
+            BackgroundColor3 = CONFIG.Colors.Background,
+            Text = emoji,
+            Font = Enum.Font.Gotham,
+            TextSize = 10,
+            Parent = actions,
+        }, {corner(4)})
+        rb.MouseButton1Click:Connect(function()
+            Remotes.AddReaction:FireServer(payload.Id, emoji)
+        end)
+    end
+
+    if isSelf then
+        local del = create("TextButton", {
+            Size = UDim2.new(0, 46, 0, 20),
+            BackgroundColor3 = CONFIG.Colors.Background,
+            Text = "Delete",
+            Font = Enum.Font.GothamMedium,
+            TextSize = 9,
+            TextColor3 = CONFIG.Colors.Red,
+            Parent = actions,
+        }, {corner(4)})
+        del.MouseButton1Click:Connect(function()
+            local ok, msg = Remotes.DeleteMessage:InvokeServer(payload.Id)
+            if not ok then notify(msg or "Delete failed.") end
+        end)
+    end
+
+    table.insert(State.Messages, holder)
+    State.MessageById[payload.Id] = holder
+
+    while #State.Messages > CONFIG.MaxMessages do
+        local old = table.remove(State.Messages, 1)
+        if old then old:Destroy() end
+    end
 
     task.defer(function()
-        chatScroll.CanvasPosition = Vector2.new(0, 99999)
+        if State.Settings.AutoScroll then
+            MessageScroll.CanvasPosition = Vector2.new(0, MessageScroll.AbsoluteCanvasSize.Y)
+        end
     end)
-end
 
-local function handleSendMessage()
-    local txt = chatInputBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
-    if txt ~= "" then
-        addChatMessage(LocalPlayer.DisplayName, txt)
-        chatInputBox.Text = ""
+    if not isSelf then
+        State.Unread += 1
+        UnreadBadge.Text = tostring(State.Unread)
+        UnreadBadge.Visible = not State.Open
+        playMessageSound()
     end
 end
 
-sendBtn.Activated:Connect(handleSendMessage)
+local function updatePlayers()
+    clearChildren(PlayerScroll)
 
-chatInputBox.FocusLost:Connect(function(enterPressed)
-    if enterPressed then
-        handleSendMessage()
+    local query = string.lower(PlayerSearch.Text or "")
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local name = string.lower(player.Name)
+            local display = string.lower(player.DisplayName)
+
+            if query == "" or name:find(query, 1, true) or display:find(query, 1, true) then
+                local row = create("Frame", {
+                    Size = UDim2.new(1, 0, 0, 38),
+                    BackgroundColor3 = CONFIG.Colors.OtherBubble,
+                    Parent = PlayerScroll,
+                }, {corner(6)})
+
+                create("TextLabel", {
+                    Size = UDim2.new(1, -130, 1, 0),
+                    Position = UDim2.new(0, 8, 0, 0),
+                    BackgroundTransparency = 1,
+                    Font = Enum.Font.GothamMedium,
+                    TextSize = 11,
+                    TextColor3 = CONFIG.Colors.Text,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    Text = player.DisplayName .. "  @" .. player.Name,
+                    Parent = row,
+                })
+
+                local dm = create("TextButton", {
+                    Size = UDim2.new(0, 52, 0, 26),
+                    Position = UDim2.new(1, -58, 0.5, 0),
+                    AnchorPoint = Vector2.new(0, 0.5),
+                    BackgroundColor3 = CONFIG.Colors.Primary,
+                    Text = "DM",
+                    Font = Enum.Font.GothamBold,
+                    TextSize = 10,
+                    TextColor3 = CONFIG.Colors.Text,
+                    Parent = row,
+                }, {corner(5)})
+
+                dm.MouseButton1Click:Connect(function()
+                    State.DMTarget = player
+                    DMHeader.Visible = true
+                    DMTitle.Text = "Direct • " .. player.DisplayName
+                    MessageInput.PlaceholderText = "Message " .. player.DisplayName .. "..."
+                    PlayersPanel.Visible = false
+                    ChatTab.BackgroundColor3 = CONFIG.Colors.Secondary
+                    PlayersTab.BackgroundColor3 = CONFIG.Colors.OtherBubble
+                end)
+            end
+        end
+    end
+end
+
+PlayerSearch:GetPropertyChangedSignal("Text"):Connect(updatePlayers)
+Players.PlayerAdded:Connect(updatePlayers)
+Players.PlayerRemoving:Connect(updatePlayers)
+
+ChatTab.MouseButton1Click:Connect(function()
+    State.Tab = "Chat"
+    PlayersPanel.Visible = false
+    ChatTab.BackgroundColor3 = CONFIG.Colors.Secondary
+    PlayersTab.BackgroundColor3 = CONFIG.Colors.OtherBubble
+end)
+
+PlayersTab.MouseButton1Click:Connect(function()
+    State.Tab = "Players"
+    PlayersPanel.Visible = true
+    ChatTab.BackgroundColor3 = CONFIG.Colors.OtherBubble
+    PlayersTab.BackgroundColor3 = CONFIG.Colors.Secondary
+    updatePlayers()
+end)
+
+DMBack.MouseButton1Click:Connect(function()
+    State.DMTarget = nil
+    DMHeader.Visible = false
+    MessageInput.PlaceholderText = "Type a message..."
+end)
+
+local function send()
+    local text = MessageInput.Text
+    if text == "" then return end
+
+    MessageInput.Text = ""
+    State.TypingSent = false
+    Remotes.SendTyping:FireServer(false)
+
+    if State.DMTarget then
+        local ok, msg = Remotes.SendDM:InvokeServer(State.DMTarget.UserId, text)
+        if not ok then
+            notify(msg or "DM failed.")
+        end
+    else
+        local replyId = State.Reply and State.Reply.Id or nil
+        local ok, msg = Remotes.SendMessage:InvokeServer(text, replyId)
+        if not ok then
+            notify(msg or "Message failed.")
+        end
+    end
+
+    setReply(nil)
+end
+
+SendButton.MouseButton1Click:Connect(send)
+
+MessageInput.FocusLost:Connect(function(enterPressed)
+    if enterPressed then send() end
+end)
+
+MessageInput.Focused:Connect(function()
+    local s = InputContainer:FindFirstChildOfClass("UIStroke")
+    if s then tween(s, 0.15, {Color = CONFIG.Colors.Primary}) end
+end)
+
+MessageInput.FocusLost:Connect(function()
+    local s = InputContainer:FindFirstChildOfClass("UIStroke")
+    if s then tween(s, 0.15, {Color = CONFIG.Colors.OtherBorder}) end
+end)
+
+MessageInput:GetPropertyChangedSignal("Text"):Connect(function()
+    if not State.Settings.Typing then return end
+
+    local typing = MessageInput.Text ~= ""
+    if typing ~= State.TypingSent then
+        State.TypingSent = typing
+        Remotes.SendTyping:FireServer(typing)
     end
 end)
 
-addChatMessage("System", "Welcome to RUBO Chat!")
+Remotes.BroadcastMessage.OnClientEvent:Connect(function(payload)
+    if payload.Action == "Delete" then
+        local item = State.MessageById[payload.Id]
+        if item then
+            item:Destroy()
+            State.MessageById[payload.Id] = nil
+        end
+        return
+    end
 
---========================================================
--- HOME
---========================================================
-local home = createPage("Home")
+    addMessage(payload, false)
+end)
 
-label(home, "WELCOME TO RUBO", UDim2.fromOffset(10, 7), UDim2.fromOffset(250, 24), 17, WHITE)
-label(home, "Minimal social interface", UDim2.fromOffset(11, 30), UDim2.fromOffset(250, 18), 10, MUTED)
+Remotes.BroadcastDM.OnClientEvent:Connect(function(payload)
+    if State.DMTarget and (
+        payload.SenderId == State.DMTarget.UserId
+        or payload.TargetId == State.DMTarget.UserId
+    ) then
+        addMessage(payload, true)
+    elseif payload.SenderId ~= LocalPlayer.UserId then
+        State.Unread += 1
+        UnreadBadge.Text = tostring(State.Unread)
+        UnreadBadge.Visible = true
+    end
+end)
 
-local homeCard = panel(home, UDim2.fromOffset(8, 55), UDim2.new(1, -16, 0, 106))
+Remotes.BroadcastReaction.OnClientEvent:Connect(function(data)
+    -- Reaction counts are intentionally displayed as a compact notification
+    -- so the existing message card is not rebuilt or duplicated.
+    if data and data.Emoji and data.Count then
+        notify(data.Emoji .. " × " .. tostring(data.Count))
+    end
+end)
 
-local homeAvatar = new("ImageLabel", {
-    Position = UDim2.fromOffset(12, 15),
-    Size = UDim2.fromOffset(58, 58),
-    BackgroundColor3 = PANEL,
-    BackgroundTransparency = 0.2,
-    Image = avatar(LocalPlayer.UserId, Enum.ThumbnailSize.Size100x100)
-}, homeCard)
-corner(homeAvatar, 29)
+local typingUsers = {}
 
-label(homeCard, LocalPlayer.DisplayName, UDim2.fromOffset(82, 13), UDim2.fromOffset(200, 22), 14, WHITE)
-label(homeCard, "@" .. LocalPlayer.Name, UDim2.fromOffset(82, 35), UDim2.fromOffset(200, 17), 10, MUTED)
+Remotes.BroadcastTyping.OnClientEvent:Connect(function(data)
+    if not State.Settings.Typing or not data then return end
 
-local online = label(homeCard, "● Online", UDim2.fromOffset(82, 55), UDim2.fromOffset(100, 18), 10, GREEN)
+    if data.IsTyping then
+        typingUsers[data.UserId] = data.DisplayName or "Player"
+    else
+        typingUsers[data.UserId] = nil
+    end
 
-local homeStats = label(homeCard, "Followers: —     Following: —", UDim2.fromOffset(82, 75), UDim2.fromOffset(250, 18), 10, TEXT)
+    local names = {}
+    for _, name in pairs(typingUsers) do
+        table.insert(names, name)
+    end
 
-local hp1 = button(home, "Profile", UDim2.fromOffset(8, 171), UDim2.fromOffset(116, 35))
-local hp2 = button(home, "Friends", UDim2.fromOffset(132, 171), UDim2.fromOffset(116, 35))
-local hp3 = button(home, "Leaderboard", UDim2.fromOffset(256, 171), UDim2.fromOffset(116, 35))
+    if #names == 0 then
+        TypingLabel.Visible = false
+        TypingLabel.Text = ""
+    else
+        TypingLabel.Visible = true
+        TypingLabel.Text = table.concat(names, ", ") .. (#names == 1 and " is typing..." or " are typing...")
+    end
+end)
 
-label(home, "RUBO keeps this area intentionally clean.", UDim2.fromOffset(10, 224), UDim2.fromOffset(350, 20), 10, MUTED)
+Remotes.SystemNotification.OnClientEvent:Connect(function(text)
+    notify(tostring(text))
+end)
 
---========================================================
--- PROFILE
---========================================================
-local profile = createPage("Profile")
+SettingsButton.MouseButton1Click:Connect(function()
+    SettingsMenu.Visible = not SettingsMenu.Visible
+end)
 
-label(profile, "PROFILE", UDim2.fromOffset(10, 7), UDim2.fromOffset(250, 22), 17, WHITE)
+MinimizeButton.MouseButton1Click:Connect(function()
+    State.Minimized = not State.Minimized
+    SettingsMenu.Visible = false
 
-local profileCard = panel(profile, UDim2.fromOffset(8, 38), UDim2.new(1, -16, 0, 160))
+    if State.Minimized then
+        Body.Visible = false
+        tween(Main, 0.25, {
+            Size = UDim2.new(Main.Size.X.Scale, Main.Size.X.Offset, 0, 44)
+        })
+    else
+        Body.Visible = true
+        local target = touch and UDim2.new(CONFIG.MobileWidth, 0, 0.55, 0)
+            or UDim2.new(CONFIG.DesktopWidth, 0, 0.58, 0)
+        tween(Main, 0.25, {Size = target})
+        State.Unread = 0
+        UnreadBadge.Visible = false
+    end
+end)
 
-local profileAvatar = new("ImageLabel", {
-    Position = UDim2.fromOffset(14, 16),
-    Size = UDim2.fromOffset(70, 70),
-    BackgroundColor3 = PANEL,
-    Image = avatar(LocalPlayer.UserId, Enum.ThumbnailSize.Size100x100)
-}, profileCard)
-corner(profileAvatar, 35)
+CloseButton.MouseButton1Click:Connect(function()
+    State.Open = false
+    SettingsMenu.Visible = false
+    local t = tween(Main, 0.2, {Size = UDim2.new(0, 0, 0, 0)})
+    if t then t.Completed:Wait() end
+    Main.Visible = false
+    Reopen.Visible = true
+end)
 
-local profileName = label(profileCard, LocalPlayer.DisplayName, UDim2.fromOffset(98, 15), UDim2.fromOffset(240, 23), 15, WHITE)
-local profileUser = label(profileCard, "@" .. LocalPlayer.Name, UDim2.fromOffset(98, 38), UDim2.fromOffset(240, 18), 10, MUTED)
-local profileId = label(profileCard, "User ID: " .. LocalPlayer.UserId, UDim2.fromOffset(98, 57), UDim2.fromOffset(240, 18), 9, TEXT)
-local profileStatus = label(profileCard, "● Online", UDim2.fromOffset(98, 77), UDim2.fromOffset(100, 18), 10, GREEN)
-local profileStats = label(profileCard, "Followers: —   Following: —", UDim2.fromOffset(14, 98), UDim2.fromOffset(300, 20), 10, TEXT)
+Reopen.MouseButton1Click:Connect(function()
+    State.Open = true
+    State.Unread = 0
+    UnreadBadge.Visible = false
+    Reopen.Visible = false
+    Main.Visible = true
+    local target = touch and UDim2.new(CONFIG.MobileWidth, 0, 0.55, 0)
+        or UDim2.new(CONFIG.DesktopWidth, 0, 0.58, 0)
+    tween(Main, 0.25, {Size = target})
+end)
 
-local followButton = button(profileCard, "Follow", UDim2.fromOffset(14, 126), UDim2.fromOffset(100, 26))
-setupFollowButton(followButton, LocalPlayer.UserId, function() return LocalPlayer.Name end)
+UserInputService.FocusedTextBoxChanged:Connect(function(box)
+    if box == MessageInput and touch and Main.Visible then
+        tween(Main, 0.2, {Position = UDim2.new(0.5, 0, 0.01, 0)})
+    elseif touch and Main.Visible then
+        tween(Main, 0.2, {Position = UDim2.new(0.5, 0, 0.05, 0)})
+    end
+end)
 
---========================================================
--- FRIENDS
---========================================================
-local friends = createPage("Friends")
+local function adapt()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
 
-label(friends, "FRIENDS", UDim2.fromOffset(10, 7), UDim2.fromOffset(250, 22), 17, WHITE)
+    local mobile = UserInputService.TouchEnabled or camera.ViewportSize.X <= 600
+    touch = mobile
 
-local friendStatus = label(
-    friends,
-    "Loading Roblox friends...",
-    UDim2.fromOffset(10, 31),
-    UDim2.fromOffset(350, 20),
-    9,
-    MUTED
-)
+    if mobile then
+        Main.Size = UDim2.new(CONFIG.MobileWidth, 0, 0.55, 0)
+        Main.Position = UDim2.new(0.5, 0, 0.05, 0)
+        Main.AnchorPoint = Vector2.new(0.5, 0)
 
-local friendContainer = new("Frame", {
-    Position = UDim2.fromOffset(8, 55),
-    Size = UDim2.new(1, -16, 0, 400),
-    BackgroundTransparency = 1
-}, friends)
+        Sidebar.Size = UDim2.new(1, -12, 0, 36)
+        Sidebar.Position = UDim2.new(0, 6, 0, 4)
+        Sidebar:FindFirstChildOfClass("UIListLayout").FillDirection = Enum.FillDirection.Horizontal
 
-local friendLayout = new("UIListLayout", {
-    Padding = UDim.new(0, 5),
-    SortOrder = Enum.SortOrder.LayoutOrder
-}, friendContainer)
+        ChatView.Size = UDim2.new(1, -12, 1, -48)
+        ChatView.Position = UDim2.new(0, 6, 0, 44)
+    else
+        Main.Size = UDim2.new(CONFIG.DesktopWidth, 0, 0.58, 0)
+        Main.Position = UDim2.new(0.02, 0, 0.15, 0)
+        Main.AnchorPoint = Vector2.new(0, 0)
 
-local function makeFriendRow(data, index)
-    local row = panel(
-        friendContainer,
-        UDim2.new(0, 0, 0, 0),
-        UDim2.new(1, 0, 0, 54)
-    )
+        Sidebar.Size = UDim2.new(0, 48, 1, -8)
+        Sidebar.Position = UDim2.new(0, 6, 0, 4)
+        Sidebar:FindFirstChildOfClass("UIListLayout").FillDirection = Enum.FillDirection.Vertical
 
-    row.LayoutOrder = index
-
-    local img = new("ImageLabel", {
-        Position = UDim2.fromOffset(7, 7),
-        Size = UDim2.fromOffset(40, 40),
-        BackgroundColor3 = PANEL,
-        Image = avatar(data.Id, Enum.ThumbnailSize.Size100x100)
-    }, row)
-
-    corner(img, 20)
-
-    label(row, data.DisplayName or data.Username, UDim2.fromOffset(56, 7), UDim2.fromOffset(145, 18), 10, WHITE)
-    label(row, "@" .. (data.Username or ""), UDim2.fromOffset(56, 25), UDim2.fromOffset(145, 16), 8, MUTED)
-
-    label(row, "Friend", UDim2.fromOffset(205, 17), UDim2.fromOffset(45, 18), 8, GREEN)
-
-    local f = button(row, "Follow", UDim2.new(1, -76, 0, 12), UDim2.fromOffset(66, 29))
-    setupFollowButton(f, data.Id, function() return data.Username end)
+        ChatView.Size = UDim2.new(1, -66, 1, -10)
+        ChatView.Position = UDim2.new(0, 60, 0, 4)
+    end
 end
+
+if workspace.CurrentCamera then
+    workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(adapt)
+end
+adapt()
+updatePlayers()
+
+local cleanup = false
+table.insert(State.Connections, ScreenGui.Destroying:Connect(function()
+    cleanup = true
+    for _, connection in ipairs(State.Connections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(State.Connections)
+end))
 
 task.spawn(function()
-    local ok, pagesObject = pcall(function()
-        return Players:GetFriendsAsync(LocalPlayer.UserId)
-    end)
+    tween(StartupTitle, 0.5, {TextTransparency = 0})
+    tween(StartupSub, 0.5, {TextTransparency = 0})
+    tween(Progress, 0.3, {BackgroundTransparency = 0.5})
+    local progressTween = tween(Fill, CONFIG.StartupTime, {Size = UDim2.new(1, 0, 1, 0)}, Enum.EasingStyle.Linear)
 
-    if not ok then
-        friendStatus.Text = "Friends API unavailable in this environment."
-        return
-    end
+    task.wait(CONFIG.StartupTime)
 
-    local count = 0
+    tween(StartupTitle, 0.25, {TextTransparency = 1})
+    tween(StartupSub, 0.25, {TextTransparency = 1})
+    tween(Progress, 0.25, {BackgroundTransparency = 1})
+    tween(Fill, 0.25, {BackgroundTransparency = 1})
 
-    repeat
-        local current = pagesObject:GetCurrentPage()
+    local fade = tween(Startup, 0.35, {BackgroundTransparency = 1})
+    if fade then fade.Completed:Wait() end
+    if cleanup then return end
 
-        for _, friend in ipairs(current) do
-            count += 1
+    Startup.Visible = false
+    Main.Visible = true
 
-            makeFriendRow({
-                Id = friend.Id,
-                Username = friend.Username,
-                DisplayName = friend.DisplayName
-            }, count)
-        end
+    local finalSize = touch and UDim2.new(CONFIG.MobileWidth, 0, 0.55, 0)
+        or UDim2.new(CONFIG.DesktopWidth, 0, 0.58, 0)
 
-        if pagesObject.IsFinished then
-            break
-        end
-
-        local nextOk = pcall(function()
-            pagesObject:AdvanceToNextPageAsync()
-        end)
-
-        if not nextOk then
-            break
-        end
-    until false
-
-    friendStatus.Text = tostring(count) .. " friend(s) loaded"
+    Main.Size = UDim2.new(0, 0, 0, 0)
+    tween(Main, 0.4, {Size = finalSize}, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+    notify("✓ Nexus Chat ready")
 end)
 
---========================================================
--- LEADERBOARD
---========================================================
-local leaderboard = createPage("Leaderboard")
-
-label(leaderboard, "RUBO LEADERBOARD", UDim2.fromOffset(10, 7), UDim2.fromOffset(280, 22), 16, WHITE)
-
-label(
-    leaderboard,
-    "Local session data — not a global ranking",
-    UDim2.fromOffset(10, 30),
-    UDim2.fromOffset(350, 18),
-    9,
-    MUTED
-)
-
-local leaderContainer = new("Frame", {
-    Position = UDim2.fromOffset(8, 55),
-    Size = UDim2.new(1, -16, 0, 300),
-    BackgroundTransparency = 1
-}, leaderboard)
-
-local leaderLayout = new("UIListLayout", {
-    Padding = UDim.new(0, 5),
-    SortOrder = Enum.SortOrder.LayoutOrder
-}, leaderContainer)
-
-local function createLeaderRow(rank, player)
-    local row = panel(
-        leaderContainer,
-        UDim2.new(),
-        UDim2.new(1, 0, 0, 48)
-    )
-
-    row.LayoutOrder = rank
-
-    if player == LocalPlayer then
-        row.BackgroundTransparency = 0.18
-    end
-
-    label(row, "#" .. rank, UDim2.fromOffset(8, 0), UDim2.fromOffset(28, 48), 11, LIGHT_BLUE)
-
-    local img = new("ImageLabel", {
-        Position = UDim2.fromOffset(40, 5),
-        Size = UDim2.fromOffset(38, 38),
-        BackgroundTransparency = 1,
-        Image = avatar(player.UserId, Enum.ThumbnailSize.Size100x100)
-    }, row)
-
-    corner(img, 19)
-
-    label(row, player.DisplayName, UDim2.fromOffset(86, 7), UDim2.fromOffset(130, 17), 10, WHITE)
-    label(row, "@" .. player.Name, UDim2.fromOffset(86, 25), UDim2.fromOffset(130, 15), 8, MUTED)
-
-    label(row, "Local", UDim2.new(1, -62, 0, 14), UDim2.fromOffset(52, 20), 9, LIGHT_BLUE)
-end
-
-local currentPlayers = Players:GetPlayers()
-
-for i, p in ipairs(currentPlayers) do
-    createLeaderRow(i, p)
-end
-
---========================================================
--- INVITE
---========================================================
-local invite = createPage("Invite")
-
-label(invite, "INVITE FRIENDS", UDim2.fromOffset(10, 7), UDim2.fromOffset(280, 22), 16, WHITE)
-
-local inviteBox = new("TextBox", {
-    Position = UDim2.fromOffset(8, 44),
-    Size = UDim2.new(1, -96, 0, 34),
-    BackgroundColor3 = PANEL,
-    BackgroundTransparency = 0.25,
-    BorderSizePixel = 0,
-    PlaceholderText = "Enter username...",
-    PlaceholderColor3 = MUTED,
-    Text = "",
-    Font = Enum.Font.Gotham,
-    TextSize = 11,
-    TextColor3 = WHITE,
-    ClearTextOnFocus = false
-}, invite)
-
-corner(inviteBox, 7)
-stroke(inviteBox, BLUE, 0.62)
-
-local inviteBtn = button(invite, "Invite", UDim2.new(1, -80, 0, 44), UDim2.fromOffset(72, 34))
-
-local inviteInfo = label(
-    invite,
-    "No invite has been sent.",
-    UDim2.fromOffset(10, 87),
-    UDim2.fromOffset(350, 20),
-    9,
-    MUTED
-)
-
-inviteBtn.Activated:Connect(function()
-    local name = inviteBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
-
-    if name == "" then
-        inviteInfo.Text = "Enter a username first."
-        return
-    end
-
-    local id = safeUserId(name)
-
-    if not id then
-        inviteInfo.Text = "Username could not be resolved."
-        return
-    end
-
-    inviteInfo.Text = "User found, but friend invites require Roblox-supported functionality."
-end)
-
---========================================================
--- NOTES
---========================================================
-local notes = createPage("Notes")
-
-label(notes, "PERSONAL NOTES", UDim2.fromOffset(10, 7), UDim2.fromOffset(280, 22), 16, WHITE)
-
-local noteBox = new("TextBox", {
-    Position = UDim2.fromOffset(8, 42),
-    Size = UDim2.new(1, -16, 0, 150),
-    BackgroundColor3 = PANEL,
-    BackgroundTransparency = 0.38,
-    BorderSizePixel = 0,
-    PlaceholderText = "Write your personal note...",
-    PlaceholderColor3 = MUTED,
-    Text = "",
-    TextWrapped = true,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top,
-    Font = Enum.Font.Gotham,
-    TextSize = 11,
-    TextColor3 = WHITE,
-    ClearTextOnFocus = false,
-    MultiLine = true
-}, notes)
-
-corner(noteBox, 9)
-stroke(noteBox, BLUE, 0.65)
-
-local saveNote = button(notes, "Save", UDim2.fromOffset(8, 201), UDim2.fromOffset(100, 32))
-local clearNote = button(notes, "Clear", UDim2.fromOffset(116, 201), UDim2.fromOffset(100, 32))
-
-local noteStatus = label(
-    notes,
-    "Notes remain local to this session.",
-    UDim2.fromOffset(8, 240),
-    UDim2.fromOffset(350, 20),
-    9,
-    MUTED
-)
-
-local sessionNote = ""
-
-saveNote.Activated:Connect(function()
-    sessionNote = noteBox.Text
-    noteStatus.Text = "Saved locally for this session."
-end)
-
-clearNote.Activated:Connect(function()
-    noteBox.Text = ""
-    sessionNote = ""
-    noteStatus.Text = "Note cleared."
-end)
-
---========================================================
--- SEARCH
---========================================================
-local search = createPage("Search")
-
-label(search, "SEARCH ROBLOX USER", UDim2.fromOffset(10, 7), UDim2.fromOffset(300, 22), 16, WHITE)
-
-local searchBox = new("TextBox", {
-    Position = UDim2.fromOffset(8, 43),
-    Size = UDim2.new(1, -96, 0, 34),
-    BackgroundColor3 = PANEL,
-    BackgroundTransparency = 0.25,
-    BorderSizePixel = 0,
-    PlaceholderText = "Enter username...",
-    PlaceholderColor3 = MUTED,
-    Text = "",
-    Font = Enum.Font.Gotham,
-    TextSize = 11,
-    TextColor3 = WHITE,
-    ClearTextOnFocus = false
-}, search)
-
-corner(searchBox, 7)
-stroke(searchBox, BLUE, 0.62)
-
-local searchBtn = button(search, "Search", UDim2.new(1, -80, 0, 43), UDim2.fromOffset(72, 34))
-
-local resultCard = panel(search, UDim2.fromOffset(8, 88), UDim2.new(1, -16, 0, 128))
-resultCard.Visible = false
-
-local resultAvatar = new("ImageLabel", {
-    Position = UDim2.fromOffset(12, 15),
-    Size = UDim2.fromOffset(60, 60),
-    BackgroundTransparency = 1
-}, resultCard)
-
-corner(resultAvatar, 30)
-
-local resultName = label(resultCard, "", UDim2.fromOffset(84, 13), UDim2.fromOffset(230, 20), 13, WHITE)
-local resultUsername = label(resultCard, "", UDim2.fromOffset(84, 34), UDim2.fromOffset(230, 17), 9, MUTED)
-local resultId = label(resultCard, "", UDim2.fromOffset(84, 52), UDim2.fromOffset(230, 17), 9, TEXT)
-local resultStatus = label(resultCard, "", UDim2.fromOffset(84, 70), UDim2.fromOffset(230, 17), 9, GREEN)
-
-local resultFollow = button(resultCard, "Follow", UDim2.fromOffset(12, 92), UDim2.fromOffset(100, 24))
-
-local currentSearchFollowConn = nil
-
-searchBtn.Activated:Connect(function()
-    local query = searchBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
-    if query == "" then return end
-    
-    local targetPlayer = nil
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p.Name:lower() == query:lower() or p.DisplayName:lower() == query:lower() then
-            targetPlayer = p
-            break
-        end
-    end
-    
-    local targetId = nil
-    local targetName = ""
-    local targetDisplayName = ""
-    local isOnlineInServer = false
-    
-    if targetPlayer then
-        targetId = targetPlayer.UserId
-        targetName = targetPlayer.Name
-        targetDisplayName = targetPlayer.DisplayName
-        isOnlineInServer = true
-    else
-        targetId = safeUserId(query)
-        if not targetId then
-            resultCard.Visible = false
-            notify("User not found.")
-            return
-        end
-        
-        local nameOk, fetchedName = pcall(function()
-            return Players:GetNameFromUserIdAsync(targetId)
-        end)
-        
-        targetName = nameOk and fetchedName or query
-        targetDisplayName = targetName
-        
-        pcall(function()
-            local infos = UserService:GetUserInfosByUserIdsAsync({targetId})
-            if infos and infos[1] and infos[1].DisplayName then
-                targetDisplayName = infos[1].DisplayName
-            end
-        end)
-    end
-    
-    resultName.Text = targetDisplayName
-    resultUsername.Text = "@" .. targetName
-    resultId.Text = "User ID: " .. tostring(targetId)
-    resultAvatar.Image = avatar(targetId, Enum.ThumbnailSize.Size100x100)
-    
-    if isOnlineInServer then
-        resultStatus.Text = "● Online in Server"
-        resultStatus.TextColor3 = GREEN
-    else
-        resultStatus.Text = "● Offline / Other Server"
-        resultStatus.TextColor3 = MUTED
-    end
-    
-    if currentSearchFollowConn then
-        currentSearchFollowConn:Disconnect()
-    end
-    
-    local function updateSearchFollowBtn()
-        local isFollowing = followedUsers[targetId] or false
-        resultFollow.Text = isFollowing and "Following" or "Follow"
-        resultFollow.TextColor3 = isFollowing and GREEN or WHITE
-    end
-    
-    updateSearchFollowBtn()
-    
-    currentSearchFollowConn = resultFollow.Activated:Connect(function()
-        followedUsers[targetId] = not followedUsers[targetId]
-        updateSearchFollowBtn()
-        if followedUsers[targetId] then
-            notify("Followed @" .. targetName)
+task.spawn(function()
+    while not cleanup do
+        if State.Settings.Glow and Main.Visible and not State.Minimized then
+            tween(Glow, 1.5, {ImageTransparency = 0.62}, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+            task.wait(1.5)
+            tween(Glow, 1.5, {ImageTransparency = 0.84}, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+            task.wait(1.5)
         else
-            notify("Unfollowed @" .. targetName)
+            task.wait(1)
         end
-    end)
-    
-    resultCard.Visible = true
+    end
 end)
 
---========================================================
--- TAB SYSTEM LOGIC (CHAT FIRST)
---========================================================
-local tabOrder = {"Chat", "Home", "Profile", "Friends", "Leaderboard", "Invite", "Notes", "Search"}
-
-local function switchTab(tabName)
-    for name, page in pairs(pages) do
-        page.Visible = (name == tabName)
-    end
 end
-
-for _, tabName in ipairs(tabOrder) do
-    local tabBtn = button(tabBar, tabName, UDim2.new(), UDim2.fromOffset(85, 26))
-    
-    tabBtn.Activated:Connect(function()
-        switchTab(tabName)
-    end)
-end
-
--- Hook up Home page shortcuts
-hp1.Activated:Connect(function() switchTab("Profile") end)
-hp2.Activated:Connect(function() switchTab("Friends") end)
-hp3.Activated:Connect(function() switchTab("Leaderboard") end)
-
-switchTab("Chat") -- Chat set as default active tab
-
---========================================================
--- DRAG & WINDOW CONTROLS
---========================================================
-close.Activated:Connect(function()
-    gui:Destroy()
-end)
-
-local minimized = false
-minimize.Activated:Connect(function()
-    minimized = not minimized
-    content.Visible = not minimized
-    tabBar.Visible = not minimized
-    
-    local targetSize = minimized and UDim2.fromOffset(400, 48) or UDim2.fromOffset(400, 350)
-    tween(main, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Size = targetSize})
-end)
-
-local dragging
-local dragInput
-local dragStart
-local startPos
-
-header.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = true
-        dragStart = input.Position
-        startPos = main.Position
-        
-        input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then
-                dragging = false
-            end
-        end)
-    end
-end)
-
-header.InputChanged:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-        dragInput = input
-    end
-end)
-
-UserInputService.InputChanged:Connect(function(input)
-    if input == dragInput and dragging then
-        local delta = input.Position - dragStart
-        main.Position = UDim2.new(
-            startPos.X.Scale, startPos.X.Offset + delta.X, 
-            startPos.Y.Scale, startPos.Y.Offset + delta.Y
-        )
-    end
-end)
