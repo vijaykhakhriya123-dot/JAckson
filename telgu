@@ -9,6 +9,7 @@ local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local StarterGui = game:GetService("StarterGui")
+local UserService = game:GetService("UserService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -31,6 +32,9 @@ local GREEN = Color3.fromRGB(80, 220, 145)
 local RED = Color3.fromRGB(255, 100, 110)
 
 local MAIN_SIZE = Vector2.new(400, 350)
+
+--// Local State
+local followedUsers = {}
 
 --// Helpers
 local function corner(obj, radius)
@@ -96,6 +100,34 @@ local function safeUserId(username)
     end
 
     return nil
+end
+
+local function setupFollowButton(btn, userId, getUsernameFunc)
+    local function updateState()
+        local isFollowing = followedUsers[userId] or false
+        if isFollowing then
+            btn.Text = "Following"
+            btn.TextColor3 = GREEN
+        else
+            btn.Text = "Follow"
+            btn.TextColor3 = WHITE
+        end
+    end
+
+    updateState()
+
+    btn.Activated:Connect(function()
+        followedUsers[userId] = not followedUsers[userId]
+        local isFollowing = followedUsers[userId]
+        updateState()
+        
+        local uname = getUsernameFunc and getUsernameFunc() or "User"
+        if isFollowing then
+            notify("Followed @" .. uname)
+        else
+            notify("Unfollowed @" .. uname)
+        end
+    end)
 end
 
 --// ScreenGui
@@ -324,6 +356,99 @@ local function panel(parent, pos, size)
 end
 
 --========================================================
+-- CHAT (FIRST TAB)
+--========================================================
+local chat = createPage("Chat")
+
+label(chat, "SESSION CHAT", UDim2.fromOffset(10, 7), UDim2.fromOffset(280, 22), 16, WHITE)
+label(chat, "Local session messaging", UDim2.fromOffset(10, 30), UDim2.fromOffset(350, 18), 9, MUTED)
+
+local chatBoxFrame = panel(chat, UDim2.fromOffset(8, 50), UDim2.new(1, -16, 0, 155))
+
+local chatScroll = new("ScrollingFrame", {
+    Position = UDim2.fromOffset(6, 6),
+    Size = UDim2.new(1, -12, 1, -12),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 2,
+    ScrollBarImageColor3 = BLUE,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y
+}, chatBoxFrame)
+
+local chatLayout = new("UIListLayout", {
+    Padding = UDim.new(0, 4),
+    SortOrder = Enum.SortOrder.LayoutOrder
+}, chatScroll)
+
+local chatInputBox = new("TextBox", {
+    Position = UDim2.fromOffset(8, 212),
+    Size = UDim2.new(1, -96, 0, 34),
+    BackgroundColor3 = PANEL,
+    BackgroundTransparency = 0.25,
+    BorderSizePixel = 0,
+    PlaceholderText = "Type a message...",
+    PlaceholderColor3 = MUTED,
+    Text = "",
+    Font = Enum.Font.Gotham,
+    TextSize = 11,
+    TextColor3 = WHITE,
+    ClearTextOnFocus = false
+}, chat)
+
+corner(chatInputBox, 7)
+stroke(chatInputBox, BLUE, 0.62)
+
+local sendBtn = button(chat, "Send", UDim2.new(1, -80, 0, 212), UDim2.fromOffset(72, 34))
+
+local msgCount = 0
+local function addChatMessage(senderName, text)
+    msgCount = msgCount + 1
+
+    local msgRow = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        BackgroundTransparency = 1,
+        LayoutOrder = msgCount
+    }, chatScroll)
+
+    local msgText = new("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        BackgroundTransparency = 1,
+        Text = "<b>" .. senderName .. ":</b> " .. text,
+        RichText = true,
+        Font = Enum.Font.Gotham,
+        TextSize = 10,
+        TextColor3 = TEXT,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextWrapped = true
+    }, msgRow)
+
+    task.defer(function()
+        chatScroll.CanvasPosition = Vector2.new(0, 99999)
+    end)
+end
+
+local function handleSendMessage()
+    local txt = chatInputBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+    if txt ~= "" then
+        addChatMessage(LocalPlayer.DisplayName, txt)
+        chatInputBox.Text = ""
+    end
+end
+
+sendBtn.Activated:Connect(handleSendMessage)
+
+chatInputBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed then
+        handleSendMessage()
+    end
+end)
+
+addChatMessage("System", "Welcome to RUBO Chat!")
+
+--========================================================
 -- HOME
 --========================================================
 local home = createPage("Home")
@@ -379,10 +504,7 @@ local profileStatus = label(profileCard, "● Online", UDim2.fromOffset(98, 77),
 local profileStats = label(profileCard, "Followers: —   Following: —", UDim2.fromOffset(14, 98), UDim2.fromOffset(300, 20), 10, TEXT)
 
 local followButton = button(profileCard, "Follow", UDim2.fromOffset(14, 126), UDim2.fromOffset(100, 26))
-
-followButton.Activated:Connect(function()
-    notify("Follow state cannot be changed directly by this client.")
-end)
+setupFollowButton(followButton, LocalPlayer.UserId, function() return LocalPlayer.Name end)
 
 --========================================================
 -- FRIENDS
@@ -435,9 +557,7 @@ local function makeFriendRow(data, index)
     label(row, "Friend", UDim2.fromOffset(205, 17), UDim2.fromOffset(45, 18), 8, GREEN)
 
     local f = button(row, "Follow", UDim2.new(1, -76, 0, 12), UDim2.fromOffset(66, 29))
-    f.Activated:Connect(function()
-        notify("Follow state is not directly writable by a client LocalScript.")
-    end)
+    setupFollowButton(f, data.Id, function() return data.Username end)
 end
 
 task.spawn(function()
@@ -697,133 +817,95 @@ local resultStatus = label(resultCard, "", UDim2.fromOffset(84, 70), UDim2.fromO
 
 local resultFollow = button(resultCard, "Follow", UDim2.fromOffset(12, 92), UDim2.fromOffset(100, 24))
 
-resultFollow.Activated:Connect(function()
-    notify("Follow state cannot be changed directly by this client.")
-end)
+local currentSearchFollowConn = nil
 
 searchBtn.Activated:Connect(function()
-    local name = searchBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
-    if name == "" then return end
+    local query = searchBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+    if query == "" then return end
     
-    local id = safeUserId(name)
-    if not id then
-        resultCard.Visible = false
-        notify("User not found.")
-        return
+    local targetPlayer = nil
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name:lower() == query:lower() or p.DisplayName:lower() == query:lower() then
+            targetPlayer = p
+            break
+        end
     end
     
-    local ok, actualName = pcall(function()
-        return Players:GetNameFromUserIdAsync(id)
-    end)
+    local targetId = nil
+    local targetName = ""
+    local targetDisplayName = ""
+    local isOnlineInServer = false
     
-    if ok then
-        resultName.Text = actualName
-        resultUsername.Text = "@" .. actualName
-        resultId.Text = "User ID: " .. tostring(id)
-        resultAvatar.Image = avatar(id, Enum.ThumbnailSize.Size100x100)
-        resultStatus.Text = "● Status Hidden"
+    if targetPlayer then
+        targetId = targetPlayer.UserId
+        targetName = targetPlayer.Name
+        targetDisplayName = targetPlayer.DisplayName
+        isOnlineInServer = true
+    else
+        targetId = safeUserId(query)
+        if not targetId then
+            resultCard.Visible = false
+            notify("User not found.")
+            return
+        end
         
-        resultCard.Visible = true
+        local nameOk, fetchedName = pcall(function()
+            return Players:GetNameFromUserIdAsync(targetId)
+        end)
+        
+        targetName = nameOk and fetchedName or query
+        targetDisplayName = targetName
+        
+        pcall(function()
+            local infos = UserService:GetUserInfosByUserIdsAsync({targetId})
+            if infos and infos[1] and infos[1].DisplayName then
+                targetDisplayName = infos[1].DisplayName
+            end
+        end)
     end
-end)
-
---========================================================
--- CHAT
---========================================================
-local chat = createPage("Chat")
-
-label(chat, "SESSION CHAT", UDim2.fromOffset(10, 7), UDim2.fromOffset(280, 22), 16, WHITE)
-label(chat, "Local session messaging", UDim2.fromOffset(10, 30), UDim2.fromOffset(350, 18), 9, MUTED)
-
-local chatBoxFrame = panel(chat, UDim2.fromOffset(8, 50), UDim2.new(1, -16, 0, 155))
-
-local chatScroll = new("ScrollingFrame", {
-    Position = UDim2.fromOffset(6, 6),
-    Size = UDim2.new(1, -12, 1, -12),
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    ScrollBarThickness = 2,
-    ScrollBarImageColor3 = BLUE,
-    CanvasSize = UDim2.new(0, 0, 0, 0),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y
-}, chatBoxFrame)
-
-local chatLayout = new("UIListLayout", {
-    Padding = UDim.new(0, 4),
-    SortOrder = Enum.SortOrder.LayoutOrder
-}, chatScroll)
-
-local chatInputBox = new("TextBox", {
-    Position = UDim2.fromOffset(8, 212),
-    Size = UDim2.new(1, -96, 0, 34),
-    BackgroundColor3 = PANEL,
-    BackgroundTransparency = 0.25,
-    BorderSizePixel = 0,
-    PlaceholderText = "Type a message...",
-    PlaceholderColor3 = MUTED,
-    Text = "",
-    Font = Enum.Font.Gotham,
-    TextSize = 11,
-    TextColor3 = WHITE,
-    ClearTextOnFocus = false
-}, chat)
-
-corner(chatInputBox, 7)
-stroke(chatInputBox, BLUE, 0.62)
-
-local sendBtn = button(chat, "Send", UDim2.new(1, -80, 0, 212), UDim2.fromOffset(72, 34))
-
-local msgCount = 0
-local function addChatMessage(senderName, text)
-    msgCount = msgCount + 1
-
-    local msgRow = new("Frame", {
-        Size = UDim2.new(1, 0, 0, 0),
-        AutomaticSize = Enum.AutomaticSize.Y,
-        BackgroundTransparency = 1,
-        LayoutOrder = msgCount
-    }, chatScroll)
-
-    local msgText = new("TextLabel", {
-        Size = UDim2.new(1, 0, 0, 0),
-        AutomaticSize = Enum.AutomaticSize.Y,
-        BackgroundTransparency = 1,
-        Text = "<b>" .. senderName .. ":</b> " .. text,
-        RichText = true,
-        Font = Enum.Font.Gotham,
-        TextSize = 10,
-        TextColor3 = TEXT,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextWrapped = true
-    }, msgRow)
-
-    task.defer(function()
-        chatScroll.CanvasPosition = Vector2.new(0, 99999)
+    
+    resultName.Text = targetDisplayName
+    resultUsername.Text = "@" .. targetName
+    resultId.Text = "User ID: " .. tostring(targetId)
+    resultAvatar.Image = avatar(targetId, Enum.ThumbnailSize.Size100x100)
+    
+    if isOnlineInServer then
+        resultStatus.Text = "● Online in Server"
+        resultStatus.TextColor3 = GREEN
+    else
+        resultStatus.Text = "● Offline / Other Server"
+        resultStatus.TextColor3 = MUTED
+    end
+    
+    if currentSearchFollowConn then
+        currentSearchFollowConn:Disconnect()
+    end
+    
+    local function updateSearchFollowBtn()
+        local isFollowing = followedUsers[targetId] or false
+        resultFollow.Text = isFollowing and "Following" or "Follow"
+        resultFollow.TextColor3 = isFollowing and GREEN or WHITE
+    end
+    
+    updateSearchFollowBtn()
+    
+    currentSearchFollowConn = resultFollow.Activated:Connect(function()
+        followedUsers[targetId] = not followedUsers[targetId]
+        updateSearchFollowBtn()
+        if followedUsers[targetId] then
+            notify("Followed @" .. targetName)
+        else
+            notify("Unfollowed @" .. targetName)
+        end
     end)
-end
-
-local function handleSendMessage()
-    local txt = chatInputBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
-    if txt ~= "" then
-        addChatMessage(LocalPlayer.DisplayName, txt)
-        chatInputBox.Text = ""
-    end
-end
-
-sendBtn.Activated:Connect(handleSendMessage)
-
-chatInputBox.FocusLost:Connect(function(enterPressed)
-    if enterPressed then
-        handleSendMessage()
-    end
+    
+    resultCard.Visible = true
 end)
 
-addChatMessage("System", "Welcome to RUBO Chat!")
-
 --========================================================
--- TAB SYSTEM LOGIC
+-- TAB SYSTEM LOGIC (CHAT FIRST)
 --========================================================
-local tabOrder = {"Home", "Profile", "Friends", "Leaderboard", "Invite", "Notes", "Search", "Chat"}
+local tabOrder = {"Chat", "Home", "Profile", "Friends", "Leaderboard", "Invite", "Notes", "Search"}
 
 local function switchTab(tabName)
     for name, page in pairs(pages) do
@@ -844,8 +926,7 @@ hp1.Activated:Connect(function() switchTab("Profile") end)
 hp2.Activated:Connect(function() switchTab("Friends") end)
 hp3.Activated:Connect(function() switchTab("Leaderboard") end)
 
-switchTab("Home") -- Default page
-
+switchTab("Chat") -- Chat set as default active tab
 
 --========================================================
 -- DRAG & WINDOW CONTROLS
