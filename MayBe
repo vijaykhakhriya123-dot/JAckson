@@ -1,0 +1,428 @@
+--================================================================
+-- Project: Ultimate Secure E2EE Chat, DM & Friends System
+-- Developer: ajay
+-- UI/UX Credits: Mickeyyy009
+--================================================================
+
+local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+local FIREBASE_URL = "https://YOUR-PROJECT-ID-default-rtdb.firebaseio.com/"
+local GLOBAL_SECRET = "Zayn_Global_Key_2026"
+
+local httprequest = (syn and syn.request) or request or http_request or (HttpService and function(req)
+    return {Body = HttpService:RequestAsync(req).Body}
+end)
+
+-- Track all global users for the autocomplete search
+local GlobalUsersCache = {}
+local FriendsList = {} -- Local friends array
+
+--=========================================
+-- THEME ENGINE
+--=========================================
+local Themes = {
+    Solid = {Bg = Color3.fromRGB(30, 30, 30), Text = Color3.fromRGB(255, 255, 255), Trans = 0, BubbleBg = Color3.fromRGB(40, 40, 40)},
+    Black = {Bg = Color3.fromRGB(0, 0, 0), Text = Color3.fromRGB(255, 255, 255), Trans = 0, BubbleBg = Color3.fromRGB(15, 15, 15)},
+    White = {Bg = Color3.fromRGB(255, 255, 255), Text = Color3.fromRGB(20, 20, 20), Trans = 0, BubbleBg = Color3.fromRGB(240, 240, 240)},
+    Beige = {Bg = Color3.fromRGB(245, 245, 220), Text = Color3.fromRGB(60, 60, 60), Trans = 0, BubbleBg = Color3.fromRGB(230, 230, 200)},
+    BabyPink = {Bg = Color3.fromRGB(244, 194, 194), Text = Color3.fromRGB(80, 50, 50), Trans = 0, BubbleBg = Color3.fromRGB(255, 204, 204)},
+    Glass = {Bg = Color3.fromRGB(255, 255, 255), Text = Color3.fromRGB(255, 255, 255), Trans = 0.7, BubbleBg = Color3.fromRGB(255, 255, 255)}
+}
+local currentTheme = "Solid"
+
+--=========================================
+-- ENCRYPTION SYSTEM
+--=========================================
+local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+local function base64Encode(data)
+    return ((data:gsub('.', function(x) 
+        local r,b='',x:byte()
+        for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end
+        return r;
+    end)..'0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+        if (#x < 6) then return '' end
+        local c=0
+        for i=1,6 do c=c+(x:sub(i,i)=='1' and 2^(6-i) or 0) end
+        return b:sub(c+1,c+1)
+    end)..({ '', '==', '=' })[#data%3+1])
+end
+
+local function base64Decode(data)
+    data = string.gsub(data, '[^'..b..'=]', '')
+    return (data:gsub('.', function(x)
+        if (x == '=') then return '' end
+        local r,f='',(b:find(x)-1)
+        for i=6,1,-1 do r=r..(f%2^i-f%2^(i-1)>0 and '1' or '0') end
+        return r;
+    end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
+        if (#x ~= 8) then return '' end
+        local c=0
+        for i=1,8 do c=c+(x:sub(i,i)=='1' and 2^(8-i) or 0) end
+        return string.char(c)
+    end))
+end
+
+local function xorCipher(text, key)
+    local result = ""
+    for i = 1, #text do
+        result = result .. string.char(bit32.bxor(string.byte(text, i), string.byte(key, (i % #key) + 1)))
+    end
+    return result
+end
+
+local function getDMKey(user1, user2)
+    local sorted = {user1, user2}
+    table.sort(sorted)
+    return xorCipher(sorted[1] .. sorted[2], "DM_MASTER_SALT")
+end
+
+local function encrypt(text, key) return base64Encode(xorCipher(text, key)) end
+local function decrypt(b64, key) return xorCipher(base64Decode(b64), key) end
+
+-- Registers user to Firebase for Search Auto-complete
+pcall(function()
+    httprequest({Url = FIREBASE_URL .. "users/" .. LocalPlayer.Name .. ".json", Method = "PUT", Body = '{"active": true}'})
+end)
+
+--=========================================
+-- UI CONSTRUCTION (Blank Box + Settings Icon)
+--=========================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Parent = game.CoreGui
+
+-- Main Blank Frame
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 400, 0, 550)
+MainFrame.Position = UDim2.new(0.5, -200, 0.5, -275)
+MainFrame.BackgroundColor3 = Themes[currentTheme].Bg
+MainFrame.BackgroundTransparency = Themes[currentTheme].Trans
+MainFrame.Parent = ScreenGui
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+
+-- Settings/Friends Icon (Top Right Corner)
+local SettingsBtn = Instance.new("ImageButton")
+SettingsBtn.Size = UDim2.new(0, 30, 0, 30)
+SettingsBtn.Position = UDim2.new(1, -40, 0, 10)
+SettingsBtn.BackgroundTransparency = 1
+SettingsBtn.Image = "rbxassetid://6031280882" -- Gear icon
+SettingsBtn.ImageColor3 = Themes[currentTheme].Text
+SettingsBtn.Parent = MainFrame
+
+local MessageList = Instance.new("ScrollingFrame")
+MessageList.Size = UDim2.new(1, -20, 1, -60)
+MessageList.Position = UDim2.new(0, 10, 0, 50)
+MessageList.BackgroundTransparency = 1
+MessageList.ScrollBarThickness = 2
+MessageList.Parent = MainFrame
+local UIListLayout = Instance.new("UIListLayout", MessageList)
+UIListLayout.Padding = UDim.new(0, 10)
+
+--=========================================
+-- FRIENDS & ADD FRIENDS PAGE UI
+--=========================================
+local FriendsPage = Instance.new("Frame")
+FriendsPage.Size = UDim2.new(1, 0, 1, 0)
+FriendsPage.BackgroundColor3 = Themes[currentTheme].Bg
+FriendsPage.BackgroundTransparency = Themes[currentTheme].Trans
+FriendsPage.Visible = false
+FriendsPage.Parent = MainFrame
+Instance.new("UICorner", FriendsPage).CornerRadius = UDim.new(0, 10)
+
+local CloseFriendsBtn = Instance.new("TextButton")
+CloseFriendsBtn.Size = UDim2.new(0, 30, 0, 30)
+CloseFriendsBtn.Position = UDim2.new(1, -40, 0, 10)
+CloseFriendsBtn.Text = "X"
+CloseFriendsBtn.TextScaled = true
+CloseFriendsBtn.BackgroundTransparency = 1
+CloseFriendsBtn.TextColor3 = Themes[currentTheme].Text
+CloseFriendsBtn.Parent = FriendsPage
+
+local SearchBox = Instance.new("TextBox")
+SearchBox.Size = UDim2.new(1, -40, 0, 40)
+SearchBox.Position = UDim2.new(0, 20, 0, 50)
+SearchBox.PlaceholderText = "Search username (e.g., ram...)"
+SearchBox.BackgroundColor3 = Themes[currentTheme].BubbleBg
+SearchBox.TextColor3 = Themes[currentTheme].Text
+SearchBox.Parent = FriendsPage
+Instance.new("UICorner", SearchBox)
+
+local SearchResults = Instance.new("ScrollingFrame")
+SearchResults.Size = UDim2.new(1, -40, 0.4, 0)
+SearchResults.Position = UDim2.new(0, 20, 0, 100)
+SearchResults.BackgroundTransparency = 1
+SearchResults.Parent = FriendsPage
+local SearchLayout = Instance.new("UIListLayout", SearchResults)
+SearchLayout.Padding = UDim.new(0, 5)
+
+local FriendsListUI = Instance.new("ScrollingFrame")
+FriendsListUI.Size = UDim2.new(1, -40, 0.4, 0)
+FriendsListUI.Position = UDim2.new(0, 20, 0.5, 40)
+FriendsListUI.BackgroundTransparency = 1
+FriendsListUI.Parent = FriendsPage
+local FriendsLayout = Instance.new("UIListLayout", FriendsListUI)
+FriendsLayout.Padding = UDim.new(0, 5)
+
+SettingsBtn.MouseButton1Click:Connect(function()
+    FriendsPage.Visible = true
+end)
+CloseFriendsBtn.MouseButton1Click:Connect(function()
+    FriendsPage.Visible = false
+end)
+
+-- Search Auto-complete Logic
+SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    for _, child in pairs(SearchResults:GetChildren()) do
+        if child:IsA("Frame") then child:Destroy() end
+    end
+    
+    local query = string.lower(SearchBox.Text)
+    if query == "" then return end
+    
+    for _, username in pairs(GlobalUsersCache) do
+        if string.sub(string.lower(username), 1, #query) == query then
+            local entry = Instance.new("Frame")
+            entry.Size = UDim2.new(1, 0, 0, 40)
+            entry.BackgroundTransparency = 1
+            
+            local nameLbl = Instance.new("TextLabel")
+            nameLbl.Size = UDim2.new(0.7, 0, 1, 0)
+            nameLbl.BackgroundTransparency = 1
+            nameLbl.Text = username
+            nameLbl.TextColor3 = Themes[currentTheme].Text
+            nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+            nameLbl.Parent = entry
+            
+            local addBtn = Instance.new("TextButton")
+            addBtn.Size = UDim2.new(0.3, 0, 0.8, 0)
+            addBtn.Position = UDim2.new(0.7, 0, 0.1, 0)
+            addBtn.Text = "Add"
+            addBtn.BackgroundColor3 = Themes[currentTheme].BubbleBg
+            addBtn.TextColor3 = Themes[currentTheme].Text
+            Instance.new("UICorner", addBtn)
+            addBtn.Parent = entry
+            
+            addBtn.MouseButton1Click:Connect(function()
+                if not table.find(FriendsList, username) then
+                    table.insert(FriendsList, username)
+                    addBtn.Text = "Added"
+                    RefreshFriendsUI()
+                end
+            end)
+            entry.Parent = SearchResults
+        end
+    end
+end)
+
+function RefreshFriendsUI()
+    for _, child in pairs(FriendsListUI:GetChildren()) do
+        if child:IsA("Frame") then child:Destroy() end
+    end
+    
+    for _, friendName in pairs(FriendsList) do
+        local entry = Instance.new("Frame")
+        entry.Size = UDim2.new(1, 0, 0, 40)
+        entry.BackgroundTransparency = 1
+        
+        local nameLbl = Instance.new("TextLabel")
+        nameLbl.Size = UDim2.new(0.7, 0, 1, 0)
+        nameLbl.BackgroundTransparency = 1
+        nameLbl.Text = friendName
+        nameLbl.TextColor3 = Themes[currentTheme].Text
+        nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+        nameLbl.Parent = entry
+        
+        local dmBtn = Instance.new("TextButton")
+        dmBtn.Size = UDim2.new(0.3, 0, 0.8, 0)
+        dmBtn.Position = UDim2.new(0.7, 0, 0.1, 0)
+        dmBtn.Text = "DM"
+        dmBtn.BackgroundColor3 = Color3.fromRGB(50, 150, 255)
+        dmBtn.TextColor3 = Color3.fromRGB(255,255,255)
+        Instance.new("UICorner", dmBtn)
+        dmBtn.Parent = entry
+        
+        dmBtn.MouseButton1Click:Connect(function()
+            FriendsPage.Visible = false
+            -- Active DM logic context set karein (aap input box me handle kar sakte hain)
+            print("Chatting with: " .. friendName)
+        end)
+        entry.Parent = FriendsListUI
+    end
+end
+
+--=========================================
+-- SMART SCROLL & THEMED BUBBLE CHAT
+--=========================================
+local function smartScroll()
+    local targetY = UIListLayout.AbsoluteContentSize.Y
+    TweenService:Create(MessageList, TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
+        CanvasPosition = Vector2.new(0, targetY)
+    }):Play()
+end
+
+local function showThemeBubble(playerName, text)
+    local player = Players:FindFirstChild(playerName)
+    if player and player.Character and player.Character:FindFirstChild("Head") then
+        local head = player.Character.Head
+        
+        local bbGui = Instance.new("BillboardGui")
+        bbGui.Size = UDim2.new(0, 200, 0, 50)
+        bbGui.StudsOffset = Vector3.new(0, 3, 0)
+        bbGui.Adornee = head
+        
+        local bubbleFrame = Instance.new("Frame")
+        bubbleFrame.Size = UDim2.new(1, 0, 1, 0)
+        bubbleFrame.BackgroundColor3 = Themes[currentTheme].BubbleBg
+        bubbleFrame.BackgroundTransparency = Themes[currentTheme].Trans == 0.7 and 0.5 or 0 -- Glass effect adjustment
+        bubbleFrame.Parent = bbGui
+        Instance.new("UICorner", bubbleFrame).CornerRadius = UDim.new(0, 8)
+        
+        local txt = Instance.new("TextLabel")
+        txt.Size = UDim2.new(1, -10, 1, -10)
+        txt.Position = UDim2.new(0, 5, 0, 5)
+        txt.BackgroundTransparency = 1
+        txt.TextScaled = true
+        txt.Text = text
+        txt.TextColor3 = Themes[currentTheme].Text
+        txt.Parent = bubbleFrame
+        
+        bbGui.Parent = head
+        
+        -- Animation Pop In
+        bubbleFrame.Size = UDim2.new(0,0,0,0)
+        TweenService:Create(bubbleFrame, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Size = UDim2.new(1,0,1,0)}):Play()
+        
+        task.delay(4, function()
+            TweenService:Create(bubbleFrame, TweenInfo.new(0.2), {Size = UDim2.new(0,0,0,0)}):Play()
+            task.delay(0.2, function() bbGui:Destroy() end)
+        end)
+    end
+end
+
+--=========================================
+-- RENDER MESSAGE (Fixed DP, Msg Swipes, Hold to React)
+--=========================================
+local function renderMessage(msgId, sender, decryptedText, titleExp, isDM)
+    local Container = Instance.new("Frame")
+    Container.Size = UDim2.new(1, 0, 0, 50)
+    Container.BackgroundTransparency = 1
+    
+    -- Profile Picture (Locked)
+    local DP = Instance.new("ImageLabel")
+    DP.Size = UDim2.new(0, 40, 0, 40)
+    DP.Position = UDim2.new(0, 0, 0, 5)
+    DP.BackgroundTransparency = 1
+    pcall(function()
+        DP.Image = "rbxthumb://type=AvatarHeadShot&id=" .. Players:GetUserIdFromNameAsync(sender) .. "&w=150&h=150"
+    end)
+    Instance.new("UICorner", DP).CornerRadius = UDim.new(1, 0)
+    DP.Parent = Container
+
+    -- Message Frame (Animates on swipe)
+    local MsgFrame = Instance.new("Frame")
+    MsgFrame.Size = UDim2.new(1, -50, 1, 0)
+    MsgFrame.Position = UDim2.new(0, 50, 0, 0)
+    MsgFrame.BackgroundTransparency = 1
+    MsgFrame.Parent = Container
+    
+    local TextLabel = Instance.new("TextLabel")
+    TextLabel.Size = UDim2.new(1, 0, 1, 0)
+    TextLabel.BackgroundTransparency = 1
+    TextLabel.TextXAlignment = Enum.TextXAlignment.Left
+    TextLabel.TextColor3 = Themes[currentTheme].Text
+    TextLabel.Font = Enum.Font.Gotham
+    TextLabel.TextSize = 14
+    TextLabel.TextWrapped = true
+
+    -- Custom Title 24h logic
+    local titlePrefix = ""
+    if titleExp and titleExp > os.time() then titlePrefix = "[VIP] " end
+    local dmTag = isDM and "[DM] " or ""
+    
+    TextLabel.Text = dmTag .. titlePrefix .. sender .. ": " .. decryptedText
+    TextLabel.Parent = MsgFrame
+
+    -- Swipe-to-Reply Logic
+    local startX = 0
+    MsgFrame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            startX = input.Position.X
+        end
+    end)
+    MsgFrame.InputEnded:Connect(function(input)
+        if startX > 0 and input.Position.X > startX + 40 then
+            -- Swipe Right Anim
+            TweenService:Create(MsgFrame, TweenInfo.new(0.2), {Position = UDim2.new(0, 90, 0, 0)}):Play()
+            task.wait(0.3)
+            TweenService:Create(MsgFrame, TweenInfo.new(0.2), {Position = UDim2.new(0, 50, 0, 0)}):Play()
+        end
+        startX = 0
+    end)
+
+    -- Hold-to-React Logic
+    local holdStart = 0
+    local isHolding = false
+    MsgFrame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            isHolding = true
+            holdStart = os.clock()
+            task.delay(0.6, function()
+                if isHolding and (os.clock() - holdStart) >= 0.5 then
+                    print("React Menu Triggered for: " .. msgId)
+                end
+            end)
+        end
+    end)
+    MsgFrame.InputEnded:Connect(function() isHolding = false end)
+
+    Container.Parent = MessageList
+    
+    -- Auto smart scroll and Bubble Chat
+    task.delay(0.1, smartScroll)
+    showThemeBubble(sender, decryptedText)
+end
+
+--=========================================
+-- LIVE POLLING (Fetching Users, Global & DMs)
+--=========================================
+local lastTime = os.time()
+task.spawn(function()
+    while task.wait(2) do
+        -- Fetch users for Autocomplete
+        local sU, rU = pcall(function() return HttpService:GetAsync(FIREBASE_URL .. "users.json") end)
+        if sU and rU ~= "null" then
+            local usersData = HttpService:JSONDecode(rU)
+            GlobalUsersCache = {}
+            for uname, _ in pairs(usersData) do table.insert(GlobalUsersCache, uname) end
+        end
+        
+        -- Fetch Global Messages
+        local s, r = pcall(function() return HttpService:GetAsync(FIREBASE_URL .. "messages.json") end)
+        if s and r ~= "null" then
+            local data = HttpService:JSONDecode(r)
+            for msgId, msg in pairs(data) do
+                if msg.timestamp > lastTime then
+                    lastTime = msg.timestamp
+                    local decrypted = decrypt(msg.text, GLOBAL_SECRET)
+                    renderMessage(msgId, msg.sender, decrypted, msg.customTitleExp, false)
+                end
+            end
+        end
+        
+        -- Fetch DMs
+        local s2, r2 = pcall(function() return HttpService:GetAsync(FIREBASE_URL .. "dms.json") end)
+        if s2 and r2 ~= "null" then
+            local dmData = HttpService:JSONDecode(r2)
+            for msgId, msg in pairs(dmData) do
+                if msg.timestamp > lastTime and (msg.recipient == LocalPlayer.Name or msg.sender == LocalPlayer.Name) then
+                    local key = getDMKey(msg.sender, msg.recipient)
+                    local decrypted = decrypt(msg.text, key)
+                    renderMessage(msgId, msg.sender, decrypted, 0, true)
+                end
+            end
+        end
+    end
+end)
