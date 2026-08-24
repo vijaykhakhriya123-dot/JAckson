@@ -1,8 +1,11 @@
 --================================================================
--- Project: Ultimate Secure E2EE Chat, DM & Friends System
+-- Project: Ultimate Secure E2EE Chat, DM & Friends System (Paid Source)
 -- Developer: Ajay
 -- UI/UX Credits: Mickeyyy009
+-- System: Modi Chat Framework
 --================================================================
+
+print("Modi Chat System Initializing...")
 
 local HttpService = game:GetService("HttpService")
 local TweenService = game:GetService("TweenService")
@@ -10,14 +13,24 @@ local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
--- Updated Custom Firebase URL
 local FIREBASE_URL = "https://daddy-s-back-default-rtdb.asia-southeast1.firebasedatabase.app/"
-local GLOBAL_SECRET = "Zayn_Global_Key_2026"
+local GLOBAL_SECRET = "Modi_Global_Key_2026"
 
--- Safe Executor HTTP Request (GET & POST dono ke liye)
-local httprequest = (syn and syn.request) or request or http_request or (fluxus and fluxus.request) or function(req)
-    warn("Executor HTTP Request not found!")
-    return {Body = "null"}
+-- Super Safe Executor HTTP Request Finder
+local httprequest = nil
+if type(request) == "function" then
+    httprequest = request
+elseif type(http_request) == "function" then
+    httprequest = http_request
+elseif syn and type(syn.request) == "function" then
+    httprequest = syn.request
+elseif fluxus and type(fluxus.request) == "function" then
+    httprequest = fluxus.request
+else
+    httprequest = function(req)
+        warn("HTTP Request API not found in this executor!")
+        return {Body = "null"}
+    end
 end
 
 local GlobalUsersCache = {}
@@ -34,7 +47,7 @@ local Themes = {
     BabyPink = {Bg = Color3.fromRGB(244, 194, 194), Text = Color3.fromRGB(80, 50, 50), Trans = 0, BubbleBg = Color3.fromRGB(255, 204, 204)},
     Glass = {Bg = Color3.fromRGB(255, 255, 255), Text = Color3.fromRGB(255, 255, 255), Trans = 0.7, BubbleBg = Color3.fromRGB(255, 255, 255)}
 }
-local currentTheme = "Solid" -- Isko change karke theme switch kar sakte ho
+local currentTheme = "Solid"
 
 --=========================================
 -- E2EE ENCRYPTION SYSTEM (XOR + Base64)
@@ -79,32 +92,40 @@ end
 local function getDMKey(user1, user2)
     local sorted = {user1, user2}
     table.sort(sorted)
-    return xorCipher(sorted[1] .. sorted[2], "DM_MASTER_SALT")
+    return xorCipher(sorted[1] .. sorted[2], "Modi_DM_SALT")
 end
 
 local function encrypt(text, key) return base64Encode(xorCipher(text, key)) end
 local function decrypt(b64, key) return xorCipher(base64Decode(b64), key) end
 
--- Firebase Search Registration
-pcall(function()
-    httprequest({Url = FIREBASE_URL .. "users/" .. LocalPlayer.Name .. ".json", Method = "PUT", Body = '{"active": true}', Headers = {["Content-Type"] = "application/json"}})
+-- Anti-Yield Firebase Registration
+task.spawn(function()
+    pcall(function()
+        httprequest({
+            Url = FIREBASE_URL .. "users/" .. LocalPlayer.Name .. ".json", 
+            Method = "PUT", 
+            Body = '{"active": true}', 
+            Headers = {["Content-Type"] = "application/json"}
+        })
+    end)
 end)
 
 --=========================================
--- UI CONSTRUCTION (400x350 Blank Box, Draggable, Toggle)
+-- UI CONSTRUCTION (Executor Safe Method)
 --=========================================
+local targetGui = (gethui and gethui()) or game:GetService("CoreGui") or LocalPlayer:WaitForChild("PlayerGui")
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "ZaynChatSystem"
-ScreenGui.Parent = game.CoreGui
+ScreenGui.Name = "ModiChatSystem"
+ScreenGui.Parent = targetGui
 ScreenGui.ResetOnSpawn = false
 
--- Open/Close Toggle Button (Floating Icon)
+-- Open/Close Toggle Button
 local ToggleBtn = Instance.new("ImageButton")
 ToggleBtn.Size = UDim2.new(0, 45, 0, 45)
 ToggleBtn.Position = UDim2.new(1, -60, 0.5, -22)
 ToggleBtn.BackgroundColor3 = Themes[currentTheme].Bg
 ToggleBtn.BackgroundTransparency = Themes[currentTheme].Trans
-ToggleBtn.Image = "rbxassetid://6031280882" -- Chat/Gear icon
+ToggleBtn.Image = "rbxassetid://6031280882"
 ToggleBtn.ImageColor3 = Themes[currentTheme].Text
 Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(1, 0)
 ToggleBtn.Parent = ScreenGui
@@ -115,7 +136,7 @@ MainFrame.Size = UDim2.new(0, 400, 0, 350)
 MainFrame.Position = UDim2.new(0.5, -200, 0.5, -175)
 MainFrame.BackgroundColor3 = Themes[currentTheme].Bg
 MainFrame.BackgroundTransparency = Themes[currentTheme].Trans
-MainFrame.Visible = false -- Initially Hidden
+MainFrame.Visible = true -- Immediately visible to confirm execution
 MainFrame.Parent = ScreenGui
 Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
 
@@ -123,10 +144,8 @@ ToggleBtn.MouseButton1Click:Connect(function()
     MainFrame.Visible = not MainFrame.Visible
 end)
 
--- SMOOTH DRAGGING LOGIC
-local dragging = false
-local dragInput, dragStart, startPos
-
+-- DRAGGABLE LOGIC
+local dragging, dragInput, dragStart, startPos
 MainFrame.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
         dragging = true
@@ -138,9 +157,7 @@ MainFrame.InputBegan:Connect(function(input)
     end
 end)
 MainFrame.InputChanged:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-        dragInput = input
-    end
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then dragInput = input end
 end)
 UserInputService.InputChanged:Connect(function(input)
     if input == dragInput and dragging then
@@ -149,7 +166,7 @@ UserInputService.InputChanged:Connect(function(input)
     end
 end)
 
--- Settings/Friends Icon (Top Right Corner of Blank Box)
+-- Settings/Friends Icon
 local SettingsBtn = Instance.new("ImageButton")
 SettingsBtn.Size = UDim2.new(0, 25, 0, 25)
 SettingsBtn.Position = UDim2.new(1, -35, 0, 10)
@@ -179,7 +196,7 @@ local UIListLayout = Instance.new("UIListLayout", MessageList)
 UIListLayout.Padding = UDim.new(0, 8)
 
 --=========================================
--- FRIENDS & ADD FRIENDS PAGE UI
+-- FRIENDS & ADD FRIENDS PAGE
 --=========================================
 local FriendsPage = Instance.new("Frame")
 FriendsPage.Size = UDim2.new(1, 0, 1, 0)
@@ -226,7 +243,6 @@ FriendsLayout.Padding = UDim.new(0, 5)
 SettingsBtn.MouseButton1Click:Connect(function() FriendsPage.Visible = true end)
 CloseFriendsBtn.MouseButton1Click:Connect(function() FriendsPage.Visible = false end)
 
--- Auto-complete Search Logic
 SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
     for _, child in pairs(SearchResults:GetChildren()) do
         if child:IsA("Frame") then child:Destroy() end
@@ -297,7 +313,8 @@ function RefreshFriendsUI()
         
         dmBtn.MouseButton1Click:Connect(function()
             FriendsPage.Visible = false
-            ChatInput.Text = "/dm " .. friendName .. " " -- Sets chat mode to DM automatically
+            ChatInput.Text = "/dm " .. friendName .. " "
+            ChatInput:CaptureFocus()
         end)
         entry.Parent = FriendsListUI
     end
@@ -348,14 +365,14 @@ local function showThemeBubble(playerName, text)
 end
 
 --=========================================
--- RENDER MESSAGE (Fixed DP, Swipe Message, 24h Timeline)
+-- RENDER MESSAGE (Fixed DP, Swipe Msg, Custom Title Timeline)
 --=========================================
 local function renderMessage(msgId, sender, decryptedText, titleExp, isDM)
     local Container = Instance.new("Frame")
     Container.Size = UDim2.new(1, 0, 0, 40)
     Container.BackgroundTransparency = 1
     
-    -- Fixed DP Frame
+    -- FIXED DP
     local DP = Instance.new("ImageLabel")
     DP.Size = UDim2.new(0, 30, 0, 30)
     DP.Position = UDim2.new(0, 0, 0, 5)
@@ -364,7 +381,7 @@ local function renderMessage(msgId, sender, decryptedText, titleExp, isDM)
     Instance.new("UICorner", DP).CornerRadius = UDim.new(1, 0)
     DP.Parent = Container
 
-    -- Message Swipe Frame
+    -- SWIPE MSG FRAME
     local MsgFrame = Instance.new("Frame")
     MsgFrame.Size = UDim2.new(1, -40, 1, 0)
     MsgFrame.Position = UDim2.new(0, 40, 0, 0)
@@ -386,7 +403,7 @@ local function renderMessage(msgId, sender, decryptedText, titleExp, isDM)
     TextLabel.Text = dmTag .. titlePrefix .. sender .. ": " .. decryptedText
     TextLabel.Parent = MsgFrame
 
-    -- Swipe-to-Reply Logic (Only MsgFrame moves)
+    -- Swipe-to-Reply Logic
     local startX = 0
     MsgFrame.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -405,15 +422,14 @@ local function renderMessage(msgId, sender, decryptedText, titleExp, isDM)
     end)
 
     -- Hold to React
-    local holdStart = 0
-    local isHolding = false
+    local holdStart, isHolding = 0, false
     MsgFrame.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
             isHolding = true
             holdStart = os.clock()
             task.delay(0.6, function()
                 if isHolding and (os.clock() - holdStart) >= 0.5 then
-                    print("React Menu Triggered for: " .. msgId)
+                    print("React Triggered for: " .. msgId)
                 end
             end)
         end
@@ -426,58 +442,59 @@ local function renderMessage(msgId, sender, decryptedText, titleExp, isDM)
 end
 
 --=========================================
--- SEND MESSAGE LOGIC (Capturing Enter Key)
+-- SEND MESSAGE LOGIC
 --=========================================
 ChatInput.FocusLost:Connect(function(enterPressed)
     if enterPressed and ChatInput.Text ~= "" then
         local rawText = ChatInput.Text
         ChatInput.Text = ""
         
-        if string.sub(rawText, 1, 4) == "/dm " then
-            local split = string.split(rawText, " ")
-            local recipient = split[2]
-            local text = string.sub(rawText, 5 + #recipient)
-            local key = getDMKey(LocalPlayer.Name, recipient)
-            
-            pcall(function()
-                httprequest({
-                    Url = FIREBASE_URL .. "dms.json",
-                    Method = "POST",
-                    Headers = {["Content-Type"] = "application/json"},
-                    Body = HttpService:JSONEncode({
-                        sender = LocalPlayer.Name,
-                        recipient = recipient,
-                        text = encrypt(text, key),
-                        timestamp = os.time()
+        task.spawn(function()
+            if string.sub(rawText, 1, 4) == "/dm " then
+                local split = string.split(rawText, " ")
+                local recipient = split[2]
+                if not recipient then return end
+                local text = string.sub(rawText, 5 + #recipient)
+                local key = getDMKey(LocalPlayer.Name, recipient)
+                
+                pcall(function()
+                    httprequest({
+                        Url = FIREBASE_URL .. "dms.json",
+                        Method = "POST",
+                        Headers = {["Content-Type"] = "application/json"},
+                        Body = HttpService:JSONEncode({
+                            sender = LocalPlayer.Name,
+                            recipient = recipient,
+                            text = encrypt(text, key),
+                            timestamp = os.time()
+                        })
                     })
-                })
-            end)
-        else
-            -- Global Send
-            pcall(function()
-                httprequest({
-                    Url = FIREBASE_URL .. "messages.json",
-                    Method = "POST",
-                    Headers = {["Content-Type"] = "application/json"},
-                    Body = HttpService:JSONEncode({
-                        sender = LocalPlayer.Name,
-                        text = encrypt(rawText, GLOBAL_SECRET),
-                        timestamp = os.time(),
-                        customTitleExp = 0 -- Default 0, modify here to grant custom 24h title via code
+                end)
+            else
+                pcall(function()
+                    httprequest({
+                        Url = FIREBASE_URL .. "messages.json",
+                        Method = "POST",
+                        Headers = {["Content-Type"] = "application/json"},
+                        Body = HttpService:JSONEncode({
+                            sender = LocalPlayer.Name,
+                            text = encrypt(rawText, GLOBAL_SECRET),
+                            timestamp = os.time(),
+                            customTitleExp = 0
+                        })
                     })
-                })
-            end)
-        end
+                end)
+            end
+        end)
     end
 end)
 
 --=========================================
--- LIVE POLLING (Fetching Users, Global & DMs Safely)
+-- LIVE POLLING (Safe Fetching)
 --=========================================
 local lastTime = os.time()
 task.spawn(function()
     while task.wait(2) do
-        -- Safe Request Wrap Function
         local function fetchJSON(path)
             local s, res = pcall(function() return httprequest({Url = FIREBASE_URL .. path, Method = "GET"}) end)
             if s and res and res.Body and res.Body ~= "null" then return HttpService:JSONDecode(res.Body) end
@@ -513,3 +530,5 @@ task.spawn(function()
         end
     end
 end)
+
+print("Modi Chat System Loaded Successfully!")
