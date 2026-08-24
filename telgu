@@ -1,1576 +1,470 @@
---[[
-    NEXUS CHAT - FINAL UNIFIED SOURCE
-    ---------------------------------
-    This is one source file containing both sides of the system.
+--// RUBO PUBLIC LIVE CHAT
+--// Firebase Realtime Database
+--// Single-file / Mobile Friendly
 
-    INSTALLATION:
-    1. Put this SAME file in ServerScriptService as a normal Script.
-    2. Put this SAME file in StarterPlayer > StarterPlayerScripts as a LocalScript.
-    3. Do not run the server copy as a LocalScript or the client copy as a Script.
+local FIREBASE_URL =
+    "https://zayn-c-default-rtdb.asia-southeast1.firebasedatabase.app"
 
-    The file automatically selects the correct side with RunService:IsServer().
-    No extra features are included beyond the supplied GUI/features/security design.
-]]
-
-local RunService = game:GetService("RunService")
-
--- ========================================================================
--- SERVER SIDE
--- ========================================================================
-if RunService:IsServer() then
-    local Players = game:GetService("Players")
-    local TextService = game:GetService("TextService")
-    local ReplicatedStorage = game:GetService("ReplicatedStorage")
-    local HttpService = game:GetService("HttpService")
-
-    local CONFIG = {
-        MaxMessageLength = 250,
-        CooldownSeconds = 0.8,
-        MaxMessagesInWindow = 5,
-        RateLimitWindowSeconds = 5,
-        BurstPenaltySeconds = 15,
-        MaxReportsPerPlayer = 3,
-        MaxGlobalMessageHistory = 100,
-        MaxDMHistoryPerPair = 50,
-        MaxSecurityLogs = 200,
-        MaxNotesLength = 250,
-        AdminUserIds = {
-            -- [YOUR_USER_ID] = true,
-        },
-    }
-
-    local network = ReplicatedStorage:FindFirstChild("NexusChatNetwork")
-    if not network then
-        network = Instance.new("Folder")
-        network.Name = "NexusChatNetwork"
-        network.Parent = ReplicatedStorage
-    end
-
-    local function remote(className, name)
-        local old = network:FindFirstChild(name)
-        if old and old.ClassName == className then
-            return old
-        end
-        if old then old:Destroy() end
-        local obj = Instance.new(className)
-        obj.Name = name
-        obj.Parent = network
-        return obj
-    end
-
-    local Remotes = {
-        SendMessage = remote("RemoteFunction", "SendMessage"),
-        SendDM = remote("RemoteFunction", "SendDM"),
-        DeleteMessage = remote("RemoteFunction", "DeleteMessage"),
-        SubmitReport = remote("RemoteFunction", "SubmitReport"),
-        AddReaction = remote("RemoteEvent", "AddReaction"),
-        SendTyping = remote("RemoteEvent", "SendTyping"),
-        BroadcastMessage = remote("RemoteEvent", "BroadcastMessage"),
-        BroadcastDM = remote("RemoteEvent", "BroadcastDM"),
-        BroadcastReaction = remote("RemoteEvent", "BroadcastReaction"),
-        BroadcastTyping = remote("RemoteEvent", "BroadcastTyping"),
-        SystemNotification = remote("RemoteEvent", "SystemNotification"),
-    }
-
-    local State = {
-        Limits = {},
-        Messages = {},
-        DMSessions = {},
-        Logs = {},
-    }
-
-    local function log(player, severity, reason)
-        table.insert(State.Logs, 1, {
-            Time = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-            UserId = player and player.UserId or 0,
-            Name = player and player.Name or "SYSTEM",
-            Severity = severity,
-            Reason = tostring(reason),
-        })
-        if #State.Logs > CONFIG.MaxSecurityLogs then
-            table.remove(State.Logs)
-        end
-        if severity == "WARNING" or severity == "EXPLOIT_ATTEMPT" then
-            warn("[NEXUS SECURITY] " .. tostring(reason))
-        end
-    end
-
-    local function validPlayer(p)
-        return typeof(p) == "Instance" and p:IsA("Player") and p:IsDescendantOf(Players)
-    end
-
-    local function validString(v, minLen, maxLen)
-        return typeof(v) == "string" and #v >= minLen and #v <= maxLen
-    end
-
-    local function validNumber(v, minValue)
-        return typeof(v) == "number" and v == v and v >= minValue
-    end
-
-    local function tracker(p)
-        local id = p.UserId
-        if not State.Limits[id] then
-            State.Limits[id] = {
-                LastMessage = 0,
-                Requests = {},
-                MutedUntil = 0,
-                Reports = 0,
-                ReportReset = os.time(),
-                TypingAt = 0,
-            }
-        end
-        return State.Limits[id]
-    end
-
-    local function rateLimit(p)
-        local t = tracker(p)
-        local now = os.clock()
-
-        if now < t.MutedUntil then
-            return false, ("Rate limit active. Wait %d second(s)."):format(math.ceil(t.MutedUntil - now))
-        end
-
-        if now - t.LastMessage < CONFIG.CooldownSeconds then
-            log(p, "LOW", "Message cooldown violation")
-            return false, "Sending messages too fast."
-        end
-
-        for i = #t.Requests, 1, -1 do
-            if now - t.Requests[i] > CONFIG.RateLimitWindowSeconds then
-                table.remove(t.Requests, i)
-            end
-        end
-
-        table.insert(t.Requests, now)
-
-        if #t.Requests > CONFIG.MaxMessagesInWindow then
-            t.MutedUntil = now + CONFIG.BurstPenaltySeconds
-            log(p, "WARNING", "Message burst rate limit exceeded")
-            return false, ("Rate limit exceeded. Wait %d second(s)."):format(CONFIG.BurstPenaltySeconds)
-        end
-
-        t.LastMessage = now
-        return true
-    end
-
-    local function filterText(text, sender, recipient)
-        if not validString(text, 1, CONFIG.MaxMessageLength) then
-            return nil, "Message must be 1-" .. CONFIG.MaxMessageLength .. " characters."
-        end
-
-        local ok, result = pcall(function()
-            return TextService:FilterStringAsync(
-                text,
-                sender.UserId,
-                Enum.TextFilterContext.PublicChat
-            )
-        end)
-
-        if not ok or not result then
-            log(sender, "WARNING", "TextService filtering failed")
-            return nil, "Text processing failed."
-        end
-
-        local success, filtered = pcall(function()
-            if recipient then
-                return result:GetChatForUserAsync(recipient.UserId)
-            end
-            return result:GetNonChatStringForBroadcastAsync()
-        end)
-
-        if not success or not filtered then
-            log(sender, "WARNING", "Filtered text retrieval failed")
-            return nil, "Text moderation failed."
-        end
-
-        return filtered
-    end
-
-    local function isAdmin(p)
-        return validPlayer(p)
-            and (CONFIG.AdminUserIds[p.UserId] == true
-            or (game.CreatorType == Enum.CreatorType.User and p.UserId == game.CreatorId))
-    end
-
-    local function sessionKey(a, b)
-        a, b = tonumber(a), tonumber(b)
-        if a > b then a, b = b, a end
-        return ("%d_%d"):format(a, b)
-    end
-
-    local function registerMessage(data)
-        State.Messages[data.Id] = data
-
-        local ids = {}
-        for id, msg in pairs(State.Messages) do
-            table.insert(ids, {Id = id, Time = msg.Timestamp})
-        end
-
-        if #ids > CONFIG.MaxGlobalMessageHistory then
-            table.sort(ids, function(a, b) return a.Time < b.Time end)
-            for i = 1, #ids - CONFIG.MaxGlobalMessageHistory do
-                State.Messages[ids[i].Id] = nil
-            end
-        end
-    end
-
-    Remotes.SendMessage.OnServerInvoke = function(player, text, replyId)
-        if not validPlayer(player) then
-            return false, "Invalid player."
-        end
-
-        local allowed, reason = rateLimit(player)
-        if not allowed then return false, reason end
-
-        local reply
-        if replyId ~= nil and validString(replyId, 1, 100) then
-            local original = State.Messages[replyId]
-            if original and not original.IsDM then
-                reply = {
-                    Id = original.Id,
-                    SenderId = original.SenderId,
-                    SenderName = original.SenderDisplayName,
-                    Text = original.Text,
-                }
-            end
-        end
-
-        local filtered, err = filterText(text, player, nil)
-        if not filtered then return false, err end
-
-        local id = "MSG_" .. HttpService:GenerateGUID(false)
-        local payload = {
-            Id = id,
-            SenderId = player.UserId,
-            SenderDisplayName = player.DisplayName,
-            SenderUsername = player.Name,
-            Text = filtered,
-            Timestamp = os.time(),
-            IsDM = false,
-            ReplyTo = reply,
-        }
-
-        registerMessage(payload)
-        Remotes.BroadcastMessage:FireAllClients(payload)
-        return true, "Message sent."
-    end
-
-    Remotes.SendDM.OnServerInvoke = function(player, recipientId, text)
-        if not validPlayer(player) then return false, "Invalid player." end
-        if not validNumber(recipientId, 1) then return false, "Invalid recipient." end
-        if recipientId == player.UserId then return false, "You cannot DM yourself." end
-
-        local recipient = Players:GetPlayerByUserId(recipientId)
-        if not recipient then return false, "Player is not in this server." end
-
-        local allowed, reason = rateLimit(player)
-        if not allowed then return false, reason end
-
-        local filtered, err = filterText(text, player, recipient)
-        if not filtered then return false, err end
-
-        local key = sessionKey(player.UserId, recipient.UserId)
-        State.DMSessions[key] = State.DMSessions[key] or {}
-
-        local id = "DM_" .. HttpService:GenerateGUID(false)
-        local payload = {
-            Id = id,
-            SenderId = player.UserId,
-            SenderDisplayName = player.DisplayName,
-            SenderUsername = player.Name,
-            TargetId = recipient.UserId,
-            Text = filtered,
-            Timestamp = os.time(),
-            IsDM = true,
-        }
-
-        registerMessage(payload)
-        table.insert(State.DMSessions[key], payload)
-
-        while #State.DMSessions[key] > CONFIG.MaxDMHistoryPerPair do
-            table.remove(State.DMSessions[key], 1)
-        end
-
-        Remotes.BroadcastDM:FireClient(player, payload)
-        Remotes.BroadcastDM:FireClient(recipient, payload)
-        return true, "DM delivered."
-    end
-
-    Remotes.DeleteMessage.OnServerInvoke = function(player, id)
-        if not validPlayer(player) or not validString(id, 1, 100) then
-            return false, "Invalid request."
-        end
-
-        local msg = State.Messages[id]
-        if not msg then return false, "Message not found." end
-
-        if msg.SenderId ~= player.UserId and not isAdmin(player) then
-            log(player, "EXPLOIT_ATTEMPT", "Unauthorized message deletion")
-            return false, "Permission denied."
-        end
-
-        State.Messages[id] = nil
-        Remotes.BroadcastMessage:FireAllClients({Action = "Delete", Id = id})
-        return true, "Message deleted."
-    end
-
-    Remotes.AddReaction.OnServerEvent:Connect(function(player, id, emoji)
-        if not validPlayer(player) then return end
-        if not validString(id, 1, 100) or not validString(emoji, 1, 10) then return end
-
-        local allowed = {
-            ["❤️"] = true, ["👍"] = true, ["😂"] = true,
-            ["😮"] = true, ["😢"] = true, ["🔥"] = true,
-        }
-        if not allowed[emoji] then
-            log(player, "WARNING", "Unsupported reaction")
-            return
-        end
-
-        local msg = State.Messages[id]
-        if not msg then return end
-
-        msg.Reactions = msg.Reactions or {}
-        msg.Reactions[emoji] = (msg.Reactions[emoji] or 0) + 1
-
-        Remotes.BroadcastReaction:FireAllClients({
-            MessageId = id,
-            Emoji = emoji,
-            Count = msg.Reactions[emoji],
-        })
-    end)
-
-    Remotes.SubmitReport.OnServerInvoke = function(player, data)
-        if not validPlayer(player) or typeof(data) ~= "table" then
-            return false, "Invalid report."
-        end
-
-        local t = tracker(player)
-        local now = os.time()
-
-        if now - t.ReportReset >= 600 then
-            t.ReportReset = now
-            t.Reports = 0
-        end
-
-        if t.Reports >= CONFIG.MaxReportsPerPlayer then
-            return false, "Report limit reached. Please wait."
-        end
-
-        local target = data.TargetUserId
-        local reason = data.Reason
-        local notes = data.Notes or ""
-
-        if not validNumber(target, 1)
-            or not validString(reason, 1, 50)
-            or not validString(notes, 0, CONFIG.MaxNotesLength) then
-            log(player, "WARNING", "Malformed report payload")
-            return false, "Invalid report data."
-        end
-
-        t.Reports += 1
-        log(player, "WARNING",
-            ("Report filed against %d | %s | %s"):format(target, reason, notes))
-
-        return true, "Report submitted."
-    end
-
-    Remotes.SendTyping.OnServerEvent:Connect(function(player, isTyping)
-        if not validPlayer(player) or typeof(isTyping) ~= "boolean" then return end
-
-        local t = tracker(player)
-        local now = os.clock()
-
-        -- Allow the stop event immediately so indicators cannot get stuck.
-        if isTyping and now - t.TypingAt < 1 then return end
-        t.TypingAt = now
-
-        for _, other in ipairs(Players:GetPlayers()) do
-            if other ~= player then
-                Remotes.BroadcastTyping:FireClient(other, {
-                    UserId = player.UserId,
-                    DisplayName = player.DisplayName,
-                    IsTyping = isTyping,
-                })
-            end
-        end
-    end)
-
-    Players.PlayerRemoving:Connect(function(player)
-        State.Limits[player.UserId] = nil
-        for key in pairs(State.DMSessions) do
-            if key:find(tostring(player.UserId), 1, true) then
-                State.DMSessions[key] = nil
-            end
-        end
-    end)
-
-    task.spawn(function()
-        while true do
-            task.wait(900)
-            local cutoff = os.time() - 7200
-            for id, msg in pairs(State.Messages) do
-                if msg.Timestamp < cutoff then
-                    State.Messages[id] = nil
-                end
-            end
-        end
-    end)
-
-    print("[Nexus Chat] Server security/message gateway ready.")
-else
-
--- ========================================================================
--- CLIENT SIDE
--- ========================================================================
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunServiceClient = game:GetService("RunService")
-local SoundService = game:GetService("SoundService")
-
 local LocalPlayer = Players.LocalPlayer
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
-local Network = ReplicatedStorage:WaitForChild("NexusChatNetwork")
 
-local Remotes = {
-    SendMessage = Network:WaitForChild("SendMessage"),
-    SendDM = Network:WaitForChild("SendDM"),
-    DeleteMessage = Network:WaitForChild("DeleteMessage"),
-    SubmitReport = Network:WaitForChild("SubmitReport"),
-    AddReaction = Network:WaitForChild("AddReaction"),
-    SendTyping = Network:WaitForChild("SendTyping"),
-    BroadcastMessage = Network:WaitForChild("BroadcastMessage"),
-    BroadcastDM = Network:WaitForChild("BroadcastDM"),
-    BroadcastReaction = Network:WaitForChild("BroadcastReaction"),
-    BroadcastTyping = Network:WaitForChild("BroadcastTyping"),
-    SystemNotification = Network:WaitForChild("SystemNotification"),
-}
+--==================================================
+-- HTTP REQUEST
+--==================================================
 
-local CONFIG = {
-    Title = "NEXUS CHAT",
-    Subtitle = "Online • Secure Link",
-    MaxMessages = 100,
-    StartupTime = 1.8,
-    MobileWidth = 0.92,
-    DesktopWidth = 0.45,
+local Request =
+    (syn and syn.request)
+    or (http and http.request)
+    or http_request
+    or request
+    or (fluxus and fluxus.request)
 
-    Colors = {
-        Background = Color3.fromRGB(8, 10, 14),
-        Panel = Color3.fromRGB(14, 18, 26),
-        Header = Color3.fromRGB(10, 12, 18),
-        Input = Color3.fromRGB(12, 15, 22),
-        Primary = Color3.fromRGB(0, 170, 255),
-        Secondary = Color3.fromRGB(0, 85, 170),
-        Glow = Color3.fromRGB(0, 195, 255),
-        Text = Color3.fromRGB(245, 248, 255),
-        Muted = Color3.fromRGB(120, 135, 160),
-        UserBubble = Color3.fromRGB(16, 30, 48),
-        OtherBubble = Color3.fromRGB(18, 22, 32),
-        UserBorder = Color3.fromRGB(0, 140, 220),
-        OtherBorder = Color3.fromRGB(35, 45, 60),
-        Red = Color3.fromRGB(210, 60, 60),
-        Green = Color3.fromRGB(40, 200, 120),
-    },
-
-    Reactions = {"❤️", "👍", "😂", "😮", "😢", "🔥"},
-}
-
-local State = {
-    Open = true,
-    Minimized = false,
-    Tab = "Chat",
-    DMTarget = nil,
-    Reply = nil,
-    Muted = {},
-    Settings = {
-        Glow = true,
-        Animations = true,
-        Notifications = true,
-        Timestamps = true,
-        AutoScroll = true,
-        Sound = true,
-        Typing = true,
-    },
-    Messages = {},
-    MessageById = {},
-    Connections = {},
-    Unread = 0,
-    TypingSent = false,
-}
-
-local function create(className, props, children)
-    local x = Instance.new(className)
-    for k, v in pairs(props or {}) do x[k] = v end
-    for _, child in ipairs(children or {}) do child.Parent = x end
-    return x
+if not Request then
+    warn("RUBO: HTTP request function not available.")
+    return
 end
 
-local function corner(radius)
-    return create("UICorner", {CornerRadius = UDim.new(0, radius)})
+local function Http(method, url, body)
+    local ok, result = pcall(function()
+        return Request({
+            Url = url,
+            Method = method,
+            Headers = {
+                ["Content-Type"] = "application/json"
+            },
+            Body = body
+        })
+    end)
+
+    if not ok then
+        return nil
+    end
+
+    return result
 end
 
-local function stroke(color, thickness, transparency)
-    return create("UIStroke", {
-        Color = color,
-        Thickness = thickness or 1,
-        Transparency = transparency or 0,
-        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-    })
+--==================================================
+-- CONFIG
+--==================================================
+
+local MAX_MESSAGE = 250
+local COOLDOWN = 2
+local POLL_TIME = 2
+
+local Username = LocalPlayer.DisplayName
+if not Username or Username == "" then
+    Username = LocalPlayer.Name
 end
 
-local function tween(obj, time, props, style, direction)
-    if not State.Settings.Animations then
-        for k, v in pairs(props) do obj[k] = v end
+Username = string.sub(Username, 1, 30)
+
+local LastSend = 0
+local Seen = {}
+
+--==================================================
+-- GUI
+--==================================================
+
+local Gui = Instance.new("ScreenGui")
+Gui.Name = "RUBO_PublicChat"
+Gui.ResetOnSpawn = false
+Gui.IgnoreGuiInset = true
+Gui.Parent = game:GetService("CoreGui")
+
+local Main = Instance.new("Frame")
+Main.Size = UDim2.fromOffset(400, 350)
+Main.Position = UDim2.new(0.5, -200, 0.5, -175)
+Main.BackgroundColor3 = Color3.fromRGB(8, 22, 42)
+Main.BackgroundTransparency = 0.12
+Main.BorderSizePixel = 0
+Main.Parent = Gui
+
+local Corner = Instance.new("UICorner")
+Corner.CornerRadius = UDim.new(0, 14)
+Corner.Parent = Main
+
+local Stroke = Instance.new("UIStroke")
+Stroke.Color = Color3.fromRGB(40, 150, 255)
+Stroke.Transparency = 0.25
+Stroke.Thickness = 1.5
+Stroke.Parent = Main
+
+--==================================================
+-- TOP BAR
+--==================================================
+
+local Top = Instance.new("Frame")
+Top.Size = UDim2.new(1, 0, 0, 48)
+Top.BackgroundTransparency = 1
+Top.Parent = Main
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, -110, 1, 0)
+Title.Position = UDim2.fromOffset(15, 0)
+Title.BackgroundTransparency = 1
+Title.Text = "RUBO  •  PUBLIC CHAT"
+Title.TextColor3 = Color3.fromRGB(90, 190, 255)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 17
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = Top
+
+local Status = Instance.new("TextLabel")
+Status.Size = UDim2.fromOffset(80, 25)
+Status.Position = UDim2.new(1, -90, 0, 12)
+Status.BackgroundTransparency = 1
+Status.Text = "● LIVE"
+Status.TextColor3 = Color3.fromRGB(70, 220, 140)
+Status.Font = Enum.Font.GothamBold
+Status.TextSize = 11
+Status.Parent = Top
+
+--==================================================
+-- CHAT SCROLL
+--==================================================
+
+local Chat = Instance.new("ScrollingFrame")
+Chat.Size = UDim2.new(1, -20, 1, -112)
+Chat.Position = UDim2.fromOffset(10, 52)
+Chat.BackgroundColor3 = Color3.fromRGB(3, 12, 25)
+Chat.BackgroundTransparency = 0.25
+Chat.BorderSizePixel = 0
+Chat.ScrollBarThickness = 3
+Chat.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Chat.CanvasSize = UDim2.new()
+Chat.Parent = Main
+
+local ChatCorner = Instance.new("UICorner")
+ChatCorner.CornerRadius = UDim.new(0, 10)
+ChatCorner.Parent = Chat
+
+local Layout = Instance.new("UIListLayout")
+Layout.Padding = UDim.new(0, 5)
+Layout.SortOrder = Enum.SortOrder.LayoutOrder
+Layout.Parent = Chat
+
+local Padding = Instance.new("UIPadding")
+Padding.PaddingTop = UDim.new(0, 7)
+Padding.PaddingBottom = UDim.new(0, 7)
+Padding.PaddingLeft = UDim.new(0, 7)
+Padding.PaddingRight = UDim.new(0, 7)
+Padding.Parent = Chat
+
+--==================================================
+-- INPUT
+--==================================================
+
+local Input = Instance.new("TextBox")
+Input.Size = UDim2.new(1, -82, 0, 42)
+Input.Position = UDim2.new(0, 10, 1, -52)
+Input.BackgroundColor3 = Color3.fromRGB(10, 30, 55)
+Input.BackgroundTransparency = 0.1
+Input.BorderSizePixel = 0
+Input.PlaceholderText = "Write a message..."
+Input.PlaceholderColor3 = Color3.fromRGB(120, 145, 170)
+Input.Text = ""
+Input.TextColor3 = Color3.fromRGB(235, 245, 255)
+Input.Font = Enum.Font.Gotham
+Input.TextSize = 13
+Input.ClearTextOnFocus = false
+Input.TextXAlignment = Enum.TextXAlignment.Left
+Input.Parent = Main
+
+local InputCorner = Instance.new("UICorner")
+InputCorner.CornerRadius = UDim.new(0, 9)
+InputCorner.Parent = Input
+
+local Send = Instance.new("TextButton")
+Send.Size = UDim2.fromOffset(62, 42)
+Send.Position = UDim2.new(1, -72, 1, -52)
+Send.BackgroundColor3 = Color3.fromRGB(25, 125, 230)
+Send.BorderSizePixel = 0
+Send.Text = "SEND"
+Send.TextColor3 = Color3.new(1, 1, 1)
+Send.Font = Enum.Font.GothamBold
+Send.TextSize = 12
+Send.Parent = Main
+
+local SendCorner = Instance.new("UICorner")
+SendCorner.CornerRadius = UDim.new(0, 9)
+SendCorner.Parent = Send
+
+--==================================================
+-- MESSAGE CREATOR
+--==================================================
+
+local function AddMessage(id, data)
+
+    if Seen[id] then
         return
     end
-    local t = TweenService:Create(
-        obj,
-        TweenInfo.new(time or 0.2, style or Enum.EasingStyle.Quart, direction or Enum.EasingDirection.Out),
-        props
-    )
-    t:Play()
-    return t
-end
 
-local function notify(text)
-    if not State.Settings.Notifications then return end
+    Seen[id] = true
 
-    local toast = create("Frame", {
-        Size = UDim2.new(1, 0, 0, 30),
-        BackgroundColor3 = CONFIG.Colors.Panel,
-        BackgroundTransparency = 0.08,
-        Parent = ToastHolder,
-    }, {
-        corner(7),
-        stroke(CONFIG.Colors.Primary, 1),
-        create("TextLabel", {
-            Size = UDim2.fromScale(1, 1),
-            BackgroundTransparency = 1,
-            Font = Enum.Font.GothamMedium,
-            TextSize = 11,
-            TextColor3 = CONFIG.Colors.Text,
-            Text = text,
-        }),
-    })
-
-    task.delay(2.5, function()
-        if toast.Parent then
-            local t = tween(toast, 0.2, {BackgroundTransparency = 1})
-            if t then t.Completed:Wait() end
-            toast:Destroy()
-        end
-    end)
-end
-
-local oldGui = PlayerGui:FindFirstChild("NexusChatFinal")
-if oldGui then oldGui:Destroy() end
-
-local ScreenGui = create("ScreenGui", {
-    Name = "NexusChatFinal",
-    ResetOnSpawn = false,
-    DisplayOrder = 100,
-    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-    Parent = PlayerGui,
-})
-
-local Startup = create("Frame", {
-    Size = UDim2.fromScale(1, 1),
-    BackgroundColor3 = CONFIG.Colors.Background,
-    ZIndex = 200,
-    Parent = ScreenGui,
-})
-
-local StartupTitle = create("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 40),
-    Position = UDim2.fromScale(0.5, 0.45),
-    AnchorPoint = Vector2.new(0.5, 0.5),
-    BackgroundTransparency = 1,
-    Text = CONFIG.Title,
-    TextColor3 = CONFIG.Colors.Text,
-    TextTransparency = 1,
-    Font = Enum.Font.GothamBold,
-    TextSize = 30,
-    Parent = Startup,
-}, {stroke(CONFIG.Colors.Glow, 2, 1)})
-
-local StartupSub = create("TextLabel", {
-    Size = UDim2.new(1, 0, 0, 20),
-    Position = UDim2.fromScale(0.5, 0.52),
-    AnchorPoint = Vector2.new(0.5, 0.5),
-    BackgroundTransparency = 1,
-    Text = "Initializing Link Protocol...",
-    TextColor3 = CONFIG.Colors.Primary,
-    TextTransparency = 1,
-    Font = Enum.Font.Code,
-    TextSize = 12,
-    Parent = Startup,
-})
-
-local Progress = create("Frame", {
-    Size = UDim2.new(0, 220, 0, 4),
-    Position = UDim2.fromScale(0.5, 0.58),
-    AnchorPoint = Vector2.new(0.5, 0.5),
-    BackgroundColor3 = CONFIG.Colors.OtherBubble,
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    Parent = Startup,
-}, {corner(4)})
-
-local Fill = create("Frame", {
-    Size = UDim2.new(0, 0, 1, 0),
-    BackgroundColor3 = CONFIG.Colors.Primary,
-    BorderSizePixel = 0,
-    Parent = Progress,
-}, {corner(4)})
-
-local touch = UserInputService.TouchEnabled
-
-local Main = create("Frame", {
-    Name = "MainChatWindow",
-    Size = touch and UDim2.new(CONFIG.MobileWidth, 0, 0.55, 0)
-        or UDim2.new(CONFIG.DesktopWidth, 0, 0.58, 0),
-    Position = touch and UDim2.new(0.5, 0, 0.05, 0)
-        or UDim2.new(0.02, 0, 0.15, 0),
-    AnchorPoint = touch and Vector2.new(0.5, 0) or Vector2.new(0, 0),
-    BackgroundColor3 = CONFIG.Colors.Panel,
-    BackgroundTransparency = 0.12,
-    Visible = false,
-    Parent = ScreenGui,
-}, {
-    corner(12),
-    stroke(CONFIG.Colors.Secondary, 1.5, 0.25),
-    create("UISizeConstraint", {
-        MinSize = Vector2.new(290, 260),
-        MaxSize = Vector2.new(850, 680),
-    }),
-})
-
-local Glow = create("ImageLabel", {
-    Size = UDim2.new(1, 40, 1, 40),
-    Position = UDim2.fromScale(0.5, 0.5),
-    AnchorPoint = Vector2.new(0.5, 0.5),
-    BackgroundTransparency = 1,
-    Image = "rbxassetid://5028857472",
-    ImageColor3 = CONFIG.Colors.Glow,
-    ImageTransparency = 0.82,
-    ZIndex = 0,
-    Parent = Main,
-})
-
-local Header = create("Frame", {
-    Size = UDim2.new(1, 0, 0, 44),
-    BackgroundColor3 = CONFIG.Colors.Header,
-    Parent = Main,
-}, {corner(12)})
-
-create("Frame", {
-    Size = UDim2.new(0, 8, 0, 8),
-    Position = UDim2.new(0, 14, 0.5, -4),
-    BackgroundColor3 = CONFIG.Colors.Green,
-    Parent = Header,
-}, {corner(4)})
-
-create("TextLabel", {
-    Size = UDim2.new(0.5, 0, 0, 18),
-    Position = UDim2.new(0, 34, 0, 4),
-    BackgroundTransparency = 1,
-    Font = Enum.Font.GothamBold,
-    TextSize = 13,
-    TextColor3 = CONFIG.Colors.Text,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    Text = CONFIG.Title,
-    Parent = Header,
-})
-
-create("TextLabel", {
-    Size = UDim2.new(0.5, 0, 0, 14),
-    Position = UDim2.new(0, 34, 0, 22),
-    BackgroundTransparency = 1,
-    Font = Enum.Font.Gotham,
-    TextSize = 10,
-    TextColor3 = CONFIG.Colors.Muted,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    Text = CONFIG.Subtitle,
-    Parent = Header,
-})
-
-local Controls = create("Frame", {
-    Size = UDim2.new(0, 100, 1, 0),
-    Position = UDim2.new(1, -8, 0, 0),
-    AnchorPoint = Vector2.new(1, 0),
-    BackgroundTransparency = 1,
-    Parent = Header,
-}, {
-    create("UIListLayout", {
-        FillDirection = Enum.FillDirection.Horizontal,
-        HorizontalAlignment = Enum.HorizontalAlignment.Right,
-        VerticalAlignment = Enum.VerticalAlignment.Center,
-        Padding = UDim.new(0, 6),
-    }),
-})
-
-local function headerButton(name, text)
-    local b = create("TextButton", {
-        Name = name,
-        Size = UDim2.new(0, 26, 0, 26),
-        BackgroundColor3 = CONFIG.Colors.OtherBubble,
-        Text = text,
-        Font = Enum.Font.GothamBold,
-        TextSize = 12,
-        TextColor3 = CONFIG.Colors.Muted,
-        AutoButtonColor = false,
-        Parent = Controls,
-    }, {corner(6), stroke(CONFIG.Colors.OtherBorder, 1)})
-
-    b.MouseEnter:Connect(function()
-        tween(b, 0.12, {
-            BackgroundColor3 = CONFIG.Colors.Secondary,
-            TextColor3 = CONFIG.Colors.Text,
-        })
-    end)
-
-    b.MouseLeave:Connect(function()
-        tween(b, 0.12, {
-            BackgroundColor3 = CONFIG.Colors.OtherBubble,
-            TextColor3 = CONFIG.Colors.Muted,
-        })
-    end)
-
-    return b
-end
-
-local SettingsButton = headerButton("SettingsButton", "⚙")
-local MinimizeButton = headerButton("MinimizeButton", "─")
-local CloseButton = headerButton("CloseButton", "✕")
-
-local Body = create("Frame", {
-    Size = UDim2.new(1, 0, 1, -44),
-    Position = UDim2.new(0, 0, 0, 44),
-    BackgroundTransparency = 1,
-    Parent = Main,
-})
-
-local Sidebar = create("Frame", {
-    Size = UDim2.new(0, 48, 1, -8),
-    Position = UDim2.new(0, 6, 0, 4),
-    BackgroundColor3 = CONFIG.Colors.Header,
-    Parent = Body,
-}, {
-    corner(8),
-    create("UIPadding", {
-        PaddingTop = UDim.new(0, 6),
-        PaddingBottom = UDim.new(0, 6),
-    }),
-    create("UIListLayout", {
-        FillDirection = Enum.FillDirection.Vertical,
-        HorizontalAlignment = Enum.HorizontalAlignment.Center,
-        Padding = UDim.new(0, 8),
-    }),
-})
-
-local function tabButton(name, icon)
-    return create("TextButton", {
-        Name = name,
-        Size = UDim2.new(0, 36, 0, 36),
-        BackgroundColor3 = CONFIG.Colors.OtherBubble,
-        Text = icon,
-        Font = Enum.Font.GothamBold,
-        TextSize = 14,
-        TextColor3 = CONFIG.Colors.Muted,
-        AutoButtonColor = false,
-        Parent = Sidebar,
-    }, {corner(8), stroke(CONFIG.Colors.OtherBorder, 1)})
-end
-
-local ChatTab = tabButton("ChatTab", "💬")
-local PlayersTab = tabButton("PlayersTab", "👥")
-
-local ChatView = create("Frame", {
-    Size = UDim2.new(1, -66, 1, -10),
-    Position = UDim2.new(0, 60, 0, 4),
-    BackgroundTransparency = 1,
-    Parent = Body,
-})
-
-local MessageScroll = create("ScrollingFrame", {
-    Name = "MessageContainer",
-    Size = UDim2.new(1, 0, 1, -58),
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    CanvasSize = UDim2.new(),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    ScrollBarThickness = 2,
-    ScrollBarImageColor3 = CONFIG.Colors.Primary,
-    Parent = ChatView,
-}, {
-    create("UIPadding", {
-        PaddingTop = UDim.new(0, 4),
-        PaddingBottom = UDim.new(0, 6),
-        PaddingLeft = UDim.new(0, 3),
-        PaddingRight = UDim.new(0, 3),
-    }),
-    create("UIListLayout", {
-        SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding = UDim.new(0, 6),
-    }),
-})
-
-local InputContainer = create("Frame", {
-    Name = "InputContainer",
-    Size = UDim2.new(1, 0, 0, 38),
-    Position = UDim2.new(0, 0, 1, 0),
-    AnchorPoint = Vector2.new(0, 1),
-    BackgroundColor3 = CONFIG.Colors.Input,
-    Parent = ChatView,
-}, {corner(8), stroke(CONFIG.Colors.OtherBorder, 1)})
-
-local MessageInput = create("TextBox", {
-    Name = "MessageInput",
-    Size = UDim2.new(1, -48, 1, 0),
-    Position = UDim2.new(0, 10, 0, 0),
-    BackgroundTransparency = 1,
-    ClearTextOnFocus = false,
-    Font = Enum.Font.Gotham,
-    TextSize = 13,
-    TextColor3 = CONFIG.Colors.Text,
-    PlaceholderColor3 = CONFIG.Colors.Muted,
-    PlaceholderText = "Type a message...",
-    TextXAlignment = Enum.TextXAlignment.Left,
-    Parent = InputContainer,
-})
-
-local SendButton = create("TextButton", {
-    Name = "SendBtn",
-    Size = UDim2.new(0, 28, 0, 28),
-    Position = UDim2.new(1, -5, 0.5, 0),
-    AnchorPoint = Vector2.new(1, 0.5),
-    BackgroundColor3 = CONFIG.Colors.Primary,
-    Text = "➤",
-    Font = Enum.Font.GothamBold,
-    TextSize = 14,
-    TextColor3 = CONFIG.Colors.Text,
-    AutoButtonColor = false,
-    Parent = InputContainer,
-}, {corner(6)})
-
-local TypingLabel = create("TextLabel", {
-    Size = UDim2.new(1, -8, 0, 14),
-    Position = UDim2.new(0, 4, 1, -54),
-    BackgroundTransparency = 1,
-    Font = Enum.Font.GothamItalic,
-    TextSize = 10,
-    TextColor3 = CONFIG.Colors.Primary,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    Visible = false,
-    Parent = ChatView,
-})
-
-local ReplyBar = create("Frame", {
-    Size = UDim2.new(1, 0, 0, 24),
-    Position = UDim2.new(0, 0, 0, -26),
-    BackgroundColor3 = CONFIG.Colors.Panel,
-    Visible = false,
-    Parent = InputContainer,
-}, {corner(6), stroke(CONFIG.Colors.Primary, 1)})
-
-local ReplyText = create("TextLabel", {
-    Size = UDim2.new(1, -26, 1, 0),
-    Position = UDim2.new(0, 8, 0, 0),
-    BackgroundTransparency = 1,
-    Font = Enum.Font.Gotham,
-    TextSize = 10,
-    TextColor3 = CONFIG.Colors.Muted,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    TextTruncate = Enum.TextTruncate.AtEnd,
-    Parent = ReplyBar,
-})
-
-local CancelReply = create("TextButton", {
-    Size = UDim2.new(0, 20, 0, 20),
-    Position = UDim2.new(1, -2, 0.5, 0),
-    AnchorPoint = Vector2.new(1, 0.5),
-    BackgroundTransparency = 1,
-    Text = "✕",
-    Font = Enum.Font.GothamBold,
-    TextSize = 11,
-    TextColor3 = CONFIG.Colors.Red,
-    Parent = ReplyBar,
-})
-
-local SettingsMenu = create("Frame", {
-    Size = UDim2.new(0, 200, 0, 220),
-    Position = UDim2.new(1, -8, 0, 48),
-    AnchorPoint = Vector2.new(1, 0),
-    BackgroundColor3 = CONFIG.Colors.Background,
-    Visible = false,
-    ZIndex = 100,
-    Parent = Main,
-}, {
-    corner(8),
-    stroke(CONFIG.Colors.Secondary, 1),
-    create("UIPadding", {
-        PaddingTop = UDim.new(0, 10),
-        PaddingBottom = UDim.new(0, 10),
-        PaddingLeft = UDim.new(0, 10),
-        PaddingRight = UDim.new(0, 10),
-    }),
-    create("UIListLayout", {
-        Padding = UDim.new(0, 6),
-        HorizontalAlignment = Enum.HorizontalAlignment.Center,
-    }),
-})
-
-local function setting(name, key)
-    local b = create("TextButton", {
-        Size = UDim2.new(1, 0, 0, 26),
-        BackgroundColor3 = CONFIG.Colors.OtherBubble,
-        Font = Enum.Font.GothamMedium,
-        TextSize = 11,
-        TextColor3 = CONFIG.Colors.Text,
-        AutoButtonColor = false,
-        Parent = SettingsMenu,
-    }, {corner(5)})
-
-    local function refresh()
-        b.Text = name .. ": " .. (State.Settings[key] and "ON" or "OFF")
-        b.BackgroundColor3 = State.Settings[key] and CONFIG.Colors.Secondary or CONFIG.Colors.OtherBubble
+    if type(data) ~= "table" then
+        return
     end
 
-    b.MouseButton1Click:Connect(function()
-        State.Settings[key] = not State.Settings[key]
-        refresh()
-        if key == "Glow" then Glow.Visible = State.Settings.Glow end
-    end)
+    local username = tostring(data.username or "Unknown")
+    local text = tostring(data.text or "")
 
-    refresh()
-end
+    local Message = Instance.new("Frame")
+    Message.Size = UDim2.new(1, -4, 0, 55)
+    Message.BackgroundColor3 = Color3.fromRGB(10, 29, 50)
+    Message.BackgroundTransparency = 0.15
+    Message.BorderSizePixel = 0
+    Message.Parent = Chat
 
-setting("Neon Glow", "Glow")
-setting("Animations", "Animations")
-setting("Notifications", "Notifications")
-setting("Timestamps", "Timestamps")
-setting("Auto Scroll", "AutoScroll")
-setting("Sound", "Sound")
-setting("Typing Indicator", "Typing")
+    local MC = Instance.new("UICorner")
+    MC.CornerRadius = UDim.new(0, 8)
+    MC.Parent = Message
 
-local Reopen = create("TextButton", {
-    Size = UDim2.new(0, 80, 0, 32),
-    Position = UDim2.new(0, 15, 0.5, -16),
-    BackgroundColor3 = CONFIG.Colors.Panel,
-    Text = "CHAT",
-    Font = Enum.Font.GothamBold,
-    TextSize = 12,
-    TextColor3 = CONFIG.Colors.Primary,
-    Visible = false,
-    Parent = ScreenGui,
-}, {corner(16), stroke(CONFIG.Colors.Primary, 1.5)})
+    local Name = Instance.new("TextLabel")
+    Name.Size = UDim2.new(1, -75, 0, 20)
+    Name.Position = UDim2.fromOffset(9, 5)
+    Name.BackgroundTransparency = 1
+    Name.Text = username
+    Name.TextColor3 = Color3.fromRGB(80, 185, 255)
+    Name.Font = Enum.Font.GothamBold
+    Name.TextSize = 12
+    Name.TextXAlignment = Enum.TextXAlignment.Left
+    Name.Parent = Message
 
-local UnreadBadge = create("TextLabel", {
-    Size = UDim2.new(0, 18, 0, 18),
-    Position = UDim2.new(1, -2, 0, -4),
-    BackgroundColor3 = CONFIG.Colors.Primary,
-    Text = "0",
-    Font = Enum.Font.GothamBold,
-    TextSize = 10,
-    TextColor3 = CONFIG.Colors.Text,
-    Visible = false,
-    Parent = Reopen,
-}, {corner(9)})
-
-local ToastHolder = create("Frame", {
-    Size = UDim2.new(0, 230, 0, 120),
-    Position = UDim2.new(0.5, 0, 0.02, 0),
-    AnchorPoint = Vector2.new(0.5, 0),
-    BackgroundTransparency = 1,
-    Parent = ScreenGui,
-}, {
-    create("UIListLayout", {
-        Padding = UDim.new(0, 5),
-        HorizontalAlignment = Enum.HorizontalAlignment.Center,
-    }),
-})
-
-local PlayersPanel = create("Frame", {
-    Size = UDim2.fromScale(1, 1),
-    BackgroundColor3 = CONFIG.Colors.Panel,
-    Visible = false,
-    Parent = ChatView,
-}, {corner(8)})
-
-local PlayerSearch = create("TextBox", {
-    Size = UDim2.new(1, -16, 0, 32),
-    Position = UDim2.new(0, 8, 0, 8),
-    BackgroundColor3 = CONFIG.Colors.Background,
-    Font = Enum.Font.Gotham,
-    TextSize = 12,
-    TextColor3 = CONFIG.Colors.Text,
-    PlaceholderColor3 = CONFIG.Colors.Muted,
-    PlaceholderText = "Search players...",
-    ClearTextOnFocus = false,
-    Parent = PlayersPanel,
-}, {corner(6), stroke(CONFIG.Colors.Secondary, 1), create("UIPadding", {PaddingLeft = UDim.new(0, 8)})})
-
-local PlayerScroll = create("ScrollingFrame", {
-    Size = UDim2.new(1, -16, 1, -50),
-    Position = UDim2.new(0, 8, 0, 44),
-    BackgroundTransparency = 1,
-    AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    ScrollBarThickness = 2,
-    ScrollBarImageColor3 = CONFIG.Colors.Primary,
-    Parent = PlayersPanel,
-}, {
-    create("UIListLayout", {Padding = UDim.new(0, 5)}),
-})
-
-local DMHeader = create("Frame", {
-    Size = UDim2.new(1, 0, 0, 28),
-    BackgroundColor3 = CONFIG.Colors.Header,
-    Visible = false,
-    Parent = ChatView,
-}, {corner(6)})
-
-local DMBack = create("TextButton", {
-    Size = UDim2.new(0, 60, 1, 0),
-    BackgroundTransparency = 1,
-    Text = "◄ Back",
-    Font = Enum.Font.GothamBold,
-    TextSize = 11,
-    TextColor3 = CONFIG.Colors.Primary,
-    Parent = DMHeader,
-})
-
-local DMTitle = create("TextLabel", {
-    Size = UDim2.new(1, -70, 1, 0),
-    Position = UDim2.new(0, 65, 0, 0),
-    BackgroundTransparency = 1,
-    Font = Enum.Font.GothamBold,
-    TextSize = 11,
-    TextColor3 = CONFIG.Colors.Text,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    Text = "Direct Conversation",
-    Parent = DMHeader,
-})
-
-local function clearChildren(container, keep)
-    for _, child in ipairs(container:GetChildren()) do
-        if child:IsA("GuiObject") and child ~= keep then child:Destroy() end
-    end
-end
-
-local function setReply(data)
-    State.Reply = data
-    if data then
-        ReplyBar.Visible = true
-        ReplyText.Text = "Replying to " .. tostring(data.SenderName) .. ": " .. tostring(data.Text)
-    else
-        ReplyBar.Visible = false
-        ReplyText.Text = ""
-    end
-end
-
-CancelReply.MouseButton1Click:Connect(function() setReply(nil) end)
-
-local function playMessageSound()
-    if not State.Settings.Sound then return end
-    local sound = Instance.new("Sound")
-    sound.SoundId = "rbxassetid://6026982404"
-    sound.Volume = 0.25
-    sound.Parent = SoundService
-    sound:Play()
-    sound.Ended:Connect(function() sound:Destroy() end)
-end
-
-local function addMessage(payload, isDM)
-    if not payload or State.Muted[payload.SenderId] then return end
-
-    local isSelf = payload.SenderId == LocalPlayer.UserId
-
-    local holder = create("Frame", {
-        Size = UDim2.new(1, 0, 0, 0),
-        AutomaticSize = Enum.AutomaticSize.Y,
-        BackgroundTransparency = 1,
-        Parent = MessageScroll,
-    })
-
-    local bubble = create("Frame", {
-        Size = UDim2.new(0.88, 0, 0, 0),
-        AutomaticSize = Enum.AutomaticSize.Y,
-        Position = isSelf and UDim2.new(1, 0, 0, 0) or UDim2.new(0, 0, 0, 0),
-        AnchorPoint = isSelf and Vector2.new(1, 0) or Vector2.new(0, 0),
-        BackgroundColor3 = isSelf and CONFIG.Colors.UserBubble or CONFIG.Colors.OtherBubble,
-        Parent = holder,
-    }, {
-        corner(8),
-        stroke(isSelf and CONFIG.Colors.UserBorder or CONFIG.Colors.OtherBorder, 1),
-        create("UIPadding", {
-            PaddingTop = UDim.new(0, 6),
-            PaddingBottom = UDim.new(0, 6),
-            PaddingLeft = UDim.new(0, 8),
-            PaddingRight = UDim.new(0, 8),
-        }),
-    })
-
-    local meta = payload.SenderDisplayName or payload.SenderUsername or "Player"
-    if State.Settings.Timestamps and payload.Timestamp then
-        meta = meta .. " [" .. os.date("%H:%M", payload.Timestamp) .. "]"
-    end
-    if isDM then meta = "DM • " .. meta end
-
-    create("TextLabel", {
-        Size = UDim2.new(1, 0, 0, 14),
-        BackgroundTransparency = 1,
-        Font = Enum.Font.GothamBold,
-        TextSize = 11,
-        TextColor3 = isSelf and CONFIG.Colors.Primary or CONFIG.Colors.Text,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        Text = meta,
-        Parent = bubble,
-    })
-
-    local body = create("TextLabel", {
-        Size = UDim2.new(1, 0, 0, 0),
-        Position = UDim2.new(0, 0, 0, 16),
-        AutomaticSize = Enum.AutomaticSize.Y,
-        BackgroundTransparency = 1,
-        Font = Enum.Font.Gotham,
-        TextSize = 12,
-        TextColor3 = CONFIG.Colors.Text,
-        TextWrapped = true,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        Text = payload.Text or "",
-        Parent = bubble,
-    })
-
-    if payload.ReplyTo then
-        create("TextLabel", {
-            Size = UDim2.new(1, 0, 0, 14),
-            Position = UDim2.new(0, 0, 0, 32),
-            BackgroundTransparency = 1,
-            Font = Enum.Font.GothamItalic,
-            TextSize = 9,
-            TextColor3 = CONFIG.Colors.Muted,
-            TextTruncate = Enum.TextTruncate.AtEnd,
-            TextXAlignment = Enum.TextXAlignment.Left,
-            Text = "↳ " .. tostring(payload.ReplyTo.SenderName) .. ": " .. tostring(payload.ReplyTo.Text),
-            Parent = bubble,
-        })
-    end
-
-    local actions = create("Frame", {
-        Size = UDim2.new(1, 0, 0, 22),
-        AutomaticSize = Enum.AutomaticSize.Y,
-        Position = UDim2.new(0, 0, 1, 4),
-        BackgroundTransparency = 1,
-        Parent = bubble,
-    }, {
-        create("UIListLayout", {
-            FillDirection = Enum.FillDirection.Horizontal,
-            Padding = UDim.new(0, 4),
-        }),
-    })
-
-    local replyBtn = create("TextButton", {
-        Size = UDim2.new(0, 48, 0, 20),
-        BackgroundColor3 = CONFIG.Colors.Background,
-        Text = "Reply",
-        Font = Enum.Font.GothamMedium,
-        TextSize = 9,
-        TextColor3 = CONFIG.Colors.Muted,
-        Parent = actions,
-    }, {corner(4)})
-
-    replyBtn.MouseButton1Click:Connect(function()
-        setReply({
-            Id = payload.Id,
-            SenderName = payload.SenderDisplayName,
-            Text = payload.Text,
-        })
-        MessageInput:CaptureFocus()
-    end)
-
-    for _, emoji in ipairs(CONFIG.Reactions) do
-        local rb = create("TextButton", {
-            Size = UDim2.new(0, 24, 0, 20),
-            BackgroundColor3 = CONFIG.Colors.Background,
-            Text = emoji,
-            Font = Enum.Font.Gotham,
-            TextSize = 10,
-            Parent = actions,
-        }, {corner(4)})
-        rb.MouseButton1Click:Connect(function()
-            Remotes.AddReaction:FireServer(payload.Id, emoji)
-        end)
-    end
-
-    if isSelf then
-        local del = create("TextButton", {
-            Size = UDim2.new(0, 46, 0, 20),
-            BackgroundColor3 = CONFIG.Colors.Background,
-            Text = "Delete",
-            Font = Enum.Font.GothamMedium,
-            TextSize = 9,
-            TextColor3 = CONFIG.Colors.Red,
-            Parent = actions,
-        }, {corner(4)})
-        del.MouseButton1Click:Connect(function()
-            local ok, msg = Remotes.DeleteMessage:InvokeServer(payload.Id)
-            if not ok then notify(msg or "Delete failed.") end
-        end)
-    end
-
-    table.insert(State.Messages, holder)
-    State.MessageById[payload.Id] = holder
-
-    while #State.Messages > CONFIG.MaxMessages do
-        local old = table.remove(State.Messages, 1)
-        if old then old:Destroy() end
-    end
+    local Text = Instance.new("TextLabel")
+    Text.Size = UDim2.new(1, -18, 0, 25)
+    Text.Position = UDim2.fromOffset(9, 25)
+    Text.BackgroundTransparency = 1
+    Text.Text = text
+    Text.TextColor3 = Color3.fromRGB(220, 232, 245)
+    Text.Font = Enum.Font.Gotham
+    Text.TextSize = 12
+    Text.TextWrapped = true
+    Text.TextXAlignment = Enum.TextXAlignment.Left
+    Text.Parent = Message
 
     task.defer(function()
-        if State.Settings.AutoScroll then
-            MessageScroll.CanvasPosition = Vector2.new(0, MessageScroll.AbsoluteCanvasSize.Y)
-        end
+        Chat.CanvasPosition = Vector2.new(
+            0,
+            math.max(0, Chat.AbsoluteCanvasSize.Y)
+        )
     end)
-
-    if not isSelf then
-        State.Unread += 1
-        UnreadBadge.Text = tostring(State.Unread)
-        UnreadBadge.Visible = not State.Open
-        playMessageSound()
-    end
 end
 
-local function updatePlayers()
-    clearChildren(PlayerScroll)
+--==================================================
+-- SEND MESSAGE
+--==================================================
 
-    local query = string.lower(PlayerSearch.Text or "")
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer then
-            local name = string.lower(player.Name)
-            local display = string.lower(player.DisplayName)
+local function SendMessage()
 
-            if query == "" or name:find(query, 1, true) or display:find(query, 1, true) then
-                local row = create("Frame", {
-                    Size = UDim2.new(1, 0, 0, 38),
-                    BackgroundColor3 = CONFIG.Colors.OtherBubble,
-                    Parent = PlayerScroll,
-                }, {corner(6)})
+    local text = Input.Text
 
-                create("TextLabel", {
-                    Size = UDim2.new(1, -130, 1, 0),
-                    Position = UDim2.new(0, 8, 0, 0),
-                    BackgroundTransparency = 1,
-                    Font = Enum.Font.GothamMedium,
-                    TextSize = 11,
-                    TextColor3 = CONFIG.Colors.Text,
-                    TextXAlignment = Enum.TextXAlignment.Left,
-                    Text = player.DisplayName .. "  @" .. player.Name,
-                    Parent = row,
-                })
-
-                local dm = create("TextButton", {
-                    Size = UDim2.new(0, 52, 0, 26),
-                    Position = UDim2.new(1, -58, 0.5, 0),
-                    AnchorPoint = Vector2.new(0, 0.5),
-                    BackgroundColor3 = CONFIG.Colors.Primary,
-                    Text = "DM",
-                    Font = Enum.Font.GothamBold,
-                    TextSize = 10,
-                    TextColor3 = CONFIG.Colors.Text,
-                    Parent = row,
-                }, {corner(5)})
-
-                dm.MouseButton1Click:Connect(function()
-                    State.DMTarget = player
-                    DMHeader.Visible = true
-                    DMTitle.Text = "Direct • " .. player.DisplayName
-                    MessageInput.PlaceholderText = "Message " .. player.DisplayName .. "..."
-                    PlayersPanel.Visible = false
-                    ChatTab.BackgroundColor3 = CONFIG.Colors.Secondary
-                    PlayersTab.BackgroundColor3 = CONFIG.Colors.OtherBubble
-                end)
-            end
-        end
-    end
-end
-
-PlayerSearch:GetPropertyChangedSignal("Text"):Connect(updatePlayers)
-Players.PlayerAdded:Connect(updatePlayers)
-Players.PlayerRemoving:Connect(updatePlayers)
-
-ChatTab.MouseButton1Click:Connect(function()
-    State.Tab = "Chat"
-    PlayersPanel.Visible = false
-    ChatTab.BackgroundColor3 = CONFIG.Colors.Secondary
-    PlayersTab.BackgroundColor3 = CONFIG.Colors.OtherBubble
-end)
-
-PlayersTab.MouseButton1Click:Connect(function()
-    State.Tab = "Players"
-    PlayersPanel.Visible = true
-    ChatTab.BackgroundColor3 = CONFIG.Colors.OtherBubble
-    PlayersTab.BackgroundColor3 = CONFIG.Colors.Secondary
-    updatePlayers()
-end)
-
-DMBack.MouseButton1Click:Connect(function()
-    State.DMTarget = nil
-    DMHeader.Visible = false
-    MessageInput.PlaceholderText = "Type a message..."
-end)
-
-local function send()
-    local text = MessageInput.Text
-    if text == "" then return end
-
-    MessageInput.Text = ""
-    State.TypingSent = false
-    Remotes.SendTyping:FireServer(false)
-
-    if State.DMTarget then
-        local ok, msg = Remotes.SendDM:InvokeServer(State.DMTarget.UserId, text)
-        if not ok then
-            notify(msg or "DM failed.")
-        end
-    else
-        local replyId = State.Reply and State.Reply.Id or nil
-        local ok, msg = Remotes.SendMessage:InvokeServer(text, replyId)
-        if not ok then
-            notify(msg or "Message failed.")
-        end
-    end
-
-    setReply(nil)
-end
-
-SendButton.MouseButton1Click:Connect(send)
-
-MessageInput.FocusLost:Connect(function(enterPressed)
-    if enterPressed then send() end
-end)
-
-MessageInput.Focused:Connect(function()
-    local s = InputContainer:FindFirstChildOfClass("UIStroke")
-    if s then tween(s, 0.15, {Color = CONFIG.Colors.Primary}) end
-end)
-
-MessageInput.FocusLost:Connect(function()
-    local s = InputContainer:FindFirstChildOfClass("UIStroke")
-    if s then tween(s, 0.15, {Color = CONFIG.Colors.OtherBorder}) end
-end)
-
-MessageInput:GetPropertyChangedSignal("Text"):Connect(function()
-    if not State.Settings.Typing then return end
-
-    local typing = MessageInput.Text ~= ""
-    if typing ~= State.TypingSent then
-        State.TypingSent = typing
-        Remotes.SendTyping:FireServer(typing)
-    end
-end)
-
-Remotes.BroadcastMessage.OnClientEvent:Connect(function(payload)
-    if payload.Action == "Delete" then
-        local item = State.MessageById[payload.Id]
-        if item then
-            item:Destroy()
-            State.MessageById[payload.Id] = nil
-        end
+    if not text then
         return
     end
 
-    addMessage(payload, false)
-end)
+    text = text:gsub("^%s+", ""):gsub("%s+$", "")
 
-Remotes.BroadcastDM.OnClientEvent:Connect(function(payload)
-    if State.DMTarget and (
-        payload.SenderId == State.DMTarget.UserId
-        or payload.TargetId == State.DMTarget.UserId
-    ) then
-        addMessage(payload, true)
-    elseif payload.SenderId ~= LocalPlayer.UserId then
-        State.Unread += 1
-        UnreadBadge.Text = tostring(State.Unread)
-        UnreadBadge.Visible = true
+    if text == "" then
+        return
+    end
+
+    if #text > MAX_MESSAGE then
+        text = string.sub(text, 1, MAX_MESSAGE)
+    end
+
+    if os.clock() - LastSend < COOLDOWN then
+        Status.Text = "● WAIT"
+        Status.TextColor3 = Color3.fromRGB(255, 190, 70)
+
+        task.delay(1, function()
+            Status.Text = "● LIVE"
+            Status.TextColor3 = Color3.fromRGB(70, 220, 140)
+        end)
+
+        return
+    end
+
+    LastSend = os.clock()
+
+    local payload = {
+        username = Username,
+        text = text,
+        timestamp = os.time()
+    }
+
+    local encoded
+
+    local success = pcall(function()
+        encoded = game:GetService("HttpService"):JSONEncode(payload)
+    end)
+
+    if not success then
+        return
+    end
+
+    local result = Http(
+        "POST",
+        FIREBASE_URL .. "/messages.json",
+        encoded
+    )
+
+    if result then
+        Input.Text = ""
+    end
+end
+
+Send.MouseButton1Click:Connect(SendMessage)
+
+Input.FocusLost:Connect(function(enterPressed)
+    if enterPressed then
+        SendMessage()
     end
 end)
 
-Remotes.BroadcastReaction.OnClientEvent:Connect(function(data)
-    -- Reaction counts are intentionally displayed as a compact notification
-    -- so the existing message card is not rebuilt or duplicated.
-    if data and data.Emoji and data.Count then
-        notify(data.Emoji .. " × " .. tostring(data.Count))
-    end
-end)
+--==================================================
+-- FETCH MESSAGES
+--==================================================
 
-local typingUsers = {}
+local function FetchMessages()
 
-Remotes.BroadcastTyping.OnClientEvent:Connect(function(data)
-    if not State.Settings.Typing or not data then return end
+    local result = Http(
+        "GET",
+        FIREBASE_URL .. "/messages.json",
+        ""
+    )
 
-    if data.IsTyping then
-        typingUsers[data.UserId] = data.DisplayName or "Player"
-    else
-        typingUsers[data.UserId] = nil
-    end
-
-    local names = {}
-    for _, name in pairs(typingUsers) do
-        table.insert(names, name)
+    if not result then
+        Status.Text = "● OFFLINE"
+        Status.TextColor3 = Color3.fromRGB(255, 80, 80)
+        return
     end
 
-    if #names == 0 then
-        TypingLabel.Visible = false
-        TypingLabel.Text = ""
-    else
-        TypingLabel.Visible = true
-        TypingLabel.Text = table.concat(names, ", ") .. (#names == 1 and " is typing..." or " are typing...")
+    local body = result.Body
+
+    if not body or body == "null" then
+        Status.Text = "● LIVE"
+        Status.TextColor3 = Color3.fromRGB(70, 220, 140)
+        return
     end
-end)
 
-Remotes.SystemNotification.OnClientEvent:Connect(function(text)
-    notify(tostring(text))
-end)
+    local data
 
-SettingsButton.MouseButton1Click:Connect(function()
-    SettingsMenu.Visible = not SettingsMenu.Visible
-end)
+    local ok = pcall(function()
+        data = game:GetService("HttpService"):JSONDecode(body)
+    end)
 
-MinimizeButton.MouseButton1Click:Connect(function()
-    State.Minimized = not State.Minimized
-    SettingsMenu.Visible = false
+    if not ok or type(data) ~= "table" then
+        return
+    end
 
-    if State.Minimized then
-        Body.Visible = false
-        tween(Main, 0.25, {
-            Size = UDim2.new(Main.Size.X.Scale, Main.Size.X.Offset, 0, 44)
+    local list = {}
+
+    for id, message in pairs(data) do
+        table.insert(list, {
+            id = id,
+            data = message
         })
-    else
-        Body.Visible = true
-        local target = touch and UDim2.new(CONFIG.MobileWidth, 0, 0.55, 0)
-            or UDim2.new(CONFIG.DesktopWidth, 0, 0.58, 0)
-        tween(Main, 0.25, {Size = target})
-        State.Unread = 0
-        UnreadBadge.Visible = false
     end
-end)
 
-CloseButton.MouseButton1Click:Connect(function()
-    State.Open = false
-    SettingsMenu.Visible = false
-    local t = tween(Main, 0.2, {Size = UDim2.new(0, 0, 0, 0)})
-    if t then t.Completed:Wait() end
-    Main.Visible = false
-    Reopen.Visible = true
-end)
+    table.sort(list, function(a, b)
+        return (tonumber(a.data.timestamp) or 0)
+            < (tonumber(b.data.timestamp) or 0)
+    end)
 
-Reopen.MouseButton1Click:Connect(function()
-    State.Open = true
-    State.Unread = 0
-    UnreadBadge.Visible = false
-    Reopen.Visible = false
-    Main.Visible = true
-    local target = touch and UDim2.new(CONFIG.MobileWidth, 0, 0.55, 0)
-        or UDim2.new(CONFIG.DesktopWidth, 0, 0.58, 0)
-    tween(Main, 0.25, {Size = target})
-end)
-
-UserInputService.FocusedTextBoxChanged:Connect(function(box)
-    if box == MessageInput and touch and Main.Visible then
-        tween(Main, 0.2, {Position = UDim2.new(0.5, 0, 0.01, 0)})
-    elseif touch and Main.Visible then
-        tween(Main, 0.2, {Position = UDim2.new(0.5, 0, 0.05, 0)})
+    for _, item in ipairs(list) do
+        AddMessage(item.id, item.data)
     end
-end)
 
-local function adapt()
-    local camera = workspace.CurrentCamera
-    if not camera then return end
-
-    local mobile = UserInputService.TouchEnabled or camera.ViewportSize.X <= 600
-    touch = mobile
-
-    if mobile then
-        Main.Size = UDim2.new(CONFIG.MobileWidth, 0, 0.55, 0)
-        Main.Position = UDim2.new(0.5, 0, 0.05, 0)
-        Main.AnchorPoint = Vector2.new(0.5, 0)
-
-        Sidebar.Size = UDim2.new(1, -12, 0, 36)
-        Sidebar.Position = UDim2.new(0, 6, 0, 4)
-        Sidebar:FindFirstChildOfClass("UIListLayout").FillDirection = Enum.FillDirection.Horizontal
-
-        ChatView.Size = UDim2.new(1, -12, 1, -48)
-        ChatView.Position = UDim2.new(0, 6, 0, 44)
-    else
-        Main.Size = UDim2.new(CONFIG.DesktopWidth, 0, 0.58, 0)
-        Main.Position = UDim2.new(0.02, 0, 0.15, 0)
-        Main.AnchorPoint = Vector2.new(0, 0)
-
-        Sidebar.Size = UDim2.new(0, 48, 1, -8)
-        Sidebar.Position = UDim2.new(0, 6, 0, 4)
-        Sidebar:FindFirstChildOfClass("UIListLayout").FillDirection = Enum.FillDirection.Vertical
-
-        ChatView.Size = UDim2.new(1, -66, 1, -10)
-        ChatView.Position = UDim2.new(0, 60, 0, 4)
-    end
+    Status.Text = "● LIVE"
+    Status.TextColor3 = Color3.fromRGB(70, 220, 140)
 end
 
-if workspace.CurrentCamera then
-    workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(adapt)
-end
-adapt()
-updatePlayers()
+--==================================================
+-- REPORT MESSAGE
+--==================================================
 
-local cleanup = false
-table.insert(State.Connections, ScreenGui.Destroying:Connect(function()
-    cleanup = true
-    for _, connection in ipairs(State.Connections) do
-        pcall(function() connection:Disconnect() end)
+local function ReportMessage(messageText)
+
+    if not messageText or messageText == "" then
+        return
     end
-    table.clear(State.Connections)
-end))
+
+    local payload = {
+        username = Username,
+        message = string.sub(messageText, 1, MAX_MESSAGE),
+        timestamp = os.time()
+    }
+
+    local encoded = game:GetService("HttpService"):JSONEncode(payload)
+
+    Http(
+        "POST",
+        FIREBASE_URL .. "/reports.json",
+        encoded
+    )
+end
+
+--==================================================
+-- START
+--==================================================
 
 task.spawn(function()
-    tween(StartupTitle, 0.5, {TextTransparency = 0})
-    tween(StartupSub, 0.5, {TextTransparency = 0})
-    tween(Progress, 0.3, {BackgroundTransparency = 0.5})
-    local progressTween = tween(Fill, CONFIG.StartupTime, {Size = UDim2.new(1, 0, 1, 0)}, Enum.EasingStyle.Linear)
 
-    task.wait(CONFIG.StartupTime)
+    task.wait(1)
 
-    tween(StartupTitle, 0.25, {TextTransparency = 1})
-    tween(StartupSub, 0.25, {TextTransparency = 1})
-    tween(Progress, 0.25, {BackgroundTransparency = 1})
-    tween(Fill, 0.25, {BackgroundTransparency = 1})
+    FetchMessages()
 
-    local fade = tween(Startup, 0.35, {BackgroundTransparency = 1})
-    if fade then fade.Completed:Wait() end
-    if cleanup then return end
+    while Gui.Parent do
+        task.wait(POLL_TIME)
+        FetchMessages()
+    end
 
-    Startup.Visible = false
-    Main.Visible = true
-
-    local finalSize = touch and UDim2.new(CONFIG.MobileWidth, 0, 0.55, 0)
-        or UDim2.new(CONFIG.DesktopWidth, 0, 0.58, 0)
-
-    Main.Size = UDim2.new(0, 0, 0, 0)
-    tween(Main, 0.4, {Size = finalSize}, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
-    notify("✓ Nexus Chat ready")
 end)
 
-task.spawn(function()
-    while not cleanup do
-        if State.Settings.Glow and Main.Visible and not State.Minimized then
-            tween(Glow, 1.5, {ImageTransparency = 0.62}, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
-            task.wait(1.5)
-            tween(Glow, 1.5, {ImageTransparency = 0.84}, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
-            task.wait(1.5)
-        else
-            task.wait(1)
-        end
+--==================================================
+-- DRAG SUPPORT
+--==================================================
+
+local dragging = false
+local dragStart
+local startPos
+
+Top.InputBegan:Connect(function(input)
+
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+
+        dragging = true
+        dragStart = input.Position
+        startPos = Main.Position
+
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
     end
 end)
 
-end
+game:GetService("UserInputService").InputChanged:Connect(function(input)
+
+    if not dragging then
+        return
+    end
+
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+
+        local delta = input.Position - dragStart
+
+        Main.Position = UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset + delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+
+print("RUBO Public Live Chat loaded.")
