@@ -1,6 +1,6 @@
 --================================================================
 -- Project: Ultimate Secure E2EE Chat, DM & Friends System
--- Developer: ajay
+-- Developer: Ajay
 -- UI/UX Credits: Mickeyyy009
 --================================================================
 
@@ -10,16 +10,15 @@ local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
-local FIREBASE_URL = "https://daddy-s-back-default-rtdb.asia-southeast1.firebasedatabase.app/"
+local FIREBASE_URL = "https://YOUR-PROJECT-ID-default-rtdb.firebaseio.com/"
 local GLOBAL_SECRET = "Zayn_Global_Key_2026"
 
 local httprequest = (syn and syn.request) or request or http_request or (HttpService and function(req)
     return {Body = HttpService:RequestAsync(req).Body}
 end)
 
--- Track all global users for the autocomplete search
 local GlobalUsersCache = {}
-local FriendsList = {} -- Local friends array
+local FriendsList = {}
 
 --=========================================
 -- THEME ENGINE
@@ -35,7 +34,7 @@ local Themes = {
 local currentTheme = "Solid"
 
 --=========================================
--- ENCRYPTION SYSTEM
+-- ENCRYPTION SYSTEM (XOR + Base64)
 --=========================================
 local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 local function base64Encode(data)
@@ -83,27 +82,75 @@ end
 local function encrypt(text, key) return base64Encode(xorCipher(text, key)) end
 local function decrypt(b64, key) return xorCipher(base64Decode(b64), key) end
 
--- Registers user to Firebase for Search Auto-complete
+-- Firebase Search Registration
 pcall(function()
     httprequest({Url = FIREBASE_URL .. "users/" .. LocalPlayer.Name .. ".json", Method = "PUT", Body = '{"active": true}'})
 end)
 
 --=========================================
--- UI CONSTRUCTION (Blank Box + Settings Icon)
+-- UI CONSTRUCTION (Blank Box, Draggable, Toggle)
 --=========================================
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Parent = game.CoreGui
+ScreenGui.ResetOnSpawn = false
 
--- Main Blank Frame
+-- Open/Close Toggle Button (Floating Icon)
+local ToggleBtn = Instance.new("ImageButton")
+ToggleBtn.Size = UDim2.new(0, 50, 0, 50)
+ToggleBtn.Position = UDim2.new(1, -70, 0.5, -25) -- Right side of screen
+ToggleBtn.BackgroundColor3 = Themes[currentTheme].Bg
+ToggleBtn.BackgroundTransparency = Themes[currentTheme].Trans
+ToggleBtn.Image = "rbxassetid://6031280882" -- Replace with any chat icon ID if needed
+ToggleBtn.ImageColor3 = Themes[currentTheme].Text
+Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(1, 0)
+ToggleBtn.Parent = ScreenGui
+
+-- Main Blank Frame (400 Width, 350 Length)
 local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 400, 0, 550)
-MainFrame.Position = UDim2.new(0.5, -200, 0.5, -275)
+MainFrame.Size = UDim2.new(0, 400, 0, 350)
+MainFrame.Position = UDim2.new(0.5, -200, 0.5, -175)
 MainFrame.BackgroundColor3 = Themes[currentTheme].Bg
 MainFrame.BackgroundTransparency = Themes[currentTheme].Trans
+MainFrame.Visible = false -- Hidden by default
 MainFrame.Parent = ScreenGui
 Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
 
--- Settings/Friends Icon (Top Right Corner)
+ToggleBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = not MainFrame.Visible
+end)
+
+-- DRAGGABLE LOGIC FOR MAIN FRAME
+local dragging = false
+local dragInput, dragStart, startPos
+
+MainFrame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = MainFrame.Position
+
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+MainFrame.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta = input.Position - dragStart
+        MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+-- Settings/Friends Icon (Top Right Corner of Blank Box)
 local SettingsBtn = Instance.new("ImageButton")
 SettingsBtn.Size = UDim2.new(0, 30, 0, 30)
 SettingsBtn.Position = UDim2.new(1, -40, 0, 10)
@@ -144,14 +191,14 @@ CloseFriendsBtn.Parent = FriendsPage
 local SearchBox = Instance.new("TextBox")
 SearchBox.Size = UDim2.new(1, -40, 0, 40)
 SearchBox.Position = UDim2.new(0, 20, 0, 50)
-SearchBox.PlaceholderText = "Search username (e.g., ram...)"
+SearchBox.PlaceholderText = "Search username..."
 SearchBox.BackgroundColor3 = Themes[currentTheme].BubbleBg
 SearchBox.TextColor3 = Themes[currentTheme].Text
 SearchBox.Parent = FriendsPage
 Instance.new("UICorner", SearchBox)
 
 local SearchResults = Instance.new("ScrollingFrame")
-SearchResults.Size = UDim2.new(1, -40, 0.4, 0)
+SearchResults.Size = UDim2.new(1, -40, 0.4, -20)
 SearchResults.Position = UDim2.new(0, 20, 0, 100)
 SearchResults.BackgroundTransparency = 1
 SearchResults.Parent = FriendsPage
@@ -159,21 +206,16 @@ local SearchLayout = Instance.new("UIListLayout", SearchResults)
 SearchLayout.Padding = UDim.new(0, 5)
 
 local FriendsListUI = Instance.new("ScrollingFrame")
-FriendsListUI.Size = UDim2.new(1, -40, 0.4, 0)
+FriendsListUI.Size = UDim2.new(1, -40, 0.4, -20)
 FriendsListUI.Position = UDim2.new(0, 20, 0.5, 40)
 FriendsListUI.BackgroundTransparency = 1
 FriendsListUI.Parent = FriendsPage
 local FriendsLayout = Instance.new("UIListLayout", FriendsListUI)
 FriendsLayout.Padding = UDim.new(0, 5)
 
-SettingsBtn.MouseButton1Click:Connect(function()
-    FriendsPage.Visible = true
-end)
-CloseFriendsBtn.MouseButton1Click:Connect(function()
-    FriendsPage.Visible = false
-end)
+SettingsBtn.MouseButton1Click:Connect(function() FriendsPage.Visible = true end)
+CloseFriendsBtn.MouseButton1Click:Connect(function() FriendsPage.Visible = false end)
 
--- Search Auto-complete Logic
 SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
     for _, child in pairs(SearchResults:GetChildren()) do
         if child:IsA("Frame") then child:Destroy() end
@@ -185,7 +227,7 @@ SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
     for _, username in pairs(GlobalUsersCache) do
         if string.sub(string.lower(username), 1, #query) == query then
             local entry = Instance.new("Frame")
-            entry.Size = UDim2.new(1, 0, 0, 40)
+            entry.Size = UDim2.new(1, 0, 0, 30)
             entry.BackgroundTransparency = 1
             
             local nameLbl = Instance.new("TextLabel")
@@ -224,7 +266,7 @@ function RefreshFriendsUI()
     
     for _, friendName in pairs(FriendsList) do
         local entry = Instance.new("Frame")
-        entry.Size = UDim2.new(1, 0, 0, 40)
+        entry.Size = UDim2.new(1, 0, 0, 30)
         entry.BackgroundTransparency = 1
         
         local nameLbl = Instance.new("TextLabel")
@@ -246,7 +288,6 @@ function RefreshFriendsUI()
         
         dmBtn.MouseButton1Click:Connect(function()
             FriendsPage.Visible = false
-            -- Active DM logic context set karein (aap input box me handle kar sakte hain)
             print("Chatting with: " .. friendName)
         end)
         entry.Parent = FriendsListUI
@@ -254,7 +295,7 @@ function RefreshFriendsUI()
 end
 
 --=========================================
--- SMART SCROLL & THEMED BUBBLE CHAT
+-- SMART SCROLL & THEMED BUBBLES
 --=========================================
 local function smartScroll()
     local targetY = UIListLayout.AbsoluteContentSize.Y
@@ -276,7 +317,7 @@ local function showThemeBubble(playerName, text)
         local bubbleFrame = Instance.new("Frame")
         bubbleFrame.Size = UDim2.new(1, 0, 1, 0)
         bubbleFrame.BackgroundColor3 = Themes[currentTheme].BubbleBg
-        bubbleFrame.BackgroundTransparency = Themes[currentTheme].Trans == 0.7 and 0.5 or 0 -- Glass effect adjustment
+        bubbleFrame.BackgroundTransparency = Themes[currentTheme].Trans == 0.7 and 0.5 or 0
         bubbleFrame.Parent = bbGui
         Instance.new("UICorner", bubbleFrame).CornerRadius = UDim.new(0, 8)
         
@@ -291,7 +332,6 @@ local function showThemeBubble(playerName, text)
         
         bbGui.Parent = head
         
-        -- Animation Pop In
         bubbleFrame.Size = UDim2.new(0,0,0,0)
         TweenService:Create(bubbleFrame, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Size = UDim2.new(1,0,1,0)}):Play()
         
@@ -303,16 +343,16 @@ local function showThemeBubble(playerName, text)
 end
 
 --=========================================
--- RENDER MESSAGE (Fixed DP, Msg Swipes, Hold to React)
+-- RENDER MESSAGE (DP Fixed, Msg Swipes, 24h Title)
 --=========================================
 local function renderMessage(msgId, sender, decryptedText, titleExp, isDM)
     local Container = Instance.new("Frame")
-    Container.Size = UDim2.new(1, 0, 0, 50)
+    Container.Size = UDim2.new(1, 0, 0, 45)
     Container.BackgroundTransparency = 1
     
-    -- Profile Picture (Locked)
+    -- DP (Fixed)
     local DP = Instance.new("ImageLabel")
-    DP.Size = UDim2.new(0, 40, 0, 40)
+    DP.Size = UDim2.new(0, 35, 0, 35)
     DP.Position = UDim2.new(0, 0, 0, 5)
     DP.BackgroundTransparency = 1
     pcall(function()
@@ -321,10 +361,10 @@ local function renderMessage(msgId, sender, decryptedText, titleExp, isDM)
     Instance.new("UICorner", DP).CornerRadius = UDim.new(1, 0)
     DP.Parent = Container
 
-    -- Message Frame (Animates on swipe)
+    -- Message Frame (Only this swipes)
     local MsgFrame = Instance.new("Frame")
-    MsgFrame.Size = UDim2.new(1, -50, 1, 0)
-    MsgFrame.Position = UDim2.new(0, 50, 0, 0)
+    MsgFrame.Size = UDim2.new(1, -45, 1, 0)
+    MsgFrame.Position = UDim2.new(0, 45, 0, 0)
     MsgFrame.BackgroundTransparency = 1
     MsgFrame.Parent = Container
     
@@ -334,10 +374,10 @@ local function renderMessage(msgId, sender, decryptedText, titleExp, isDM)
     TextLabel.TextXAlignment = Enum.TextXAlignment.Left
     TextLabel.TextColor3 = Themes[currentTheme].Text
     TextLabel.Font = Enum.Font.Gotham
-    TextLabel.TextSize = 14
+    TextLabel.TextSize = 13
     TextLabel.TextWrapped = true
 
-    -- Custom Title 24h logic
+    -- Custom 24-hour title duration logic
     local titlePrefix = ""
     if titleExp and titleExp > os.time() then titlePrefix = "[VIP] " end
     local dmTag = isDM and "[DM] " or ""
@@ -345,7 +385,7 @@ local function renderMessage(msgId, sender, decryptedText, titleExp, isDM)
     TextLabel.Text = dmTag .. titlePrefix .. sender .. ": " .. decryptedText
     TextLabel.Parent = MsgFrame
 
-    -- Swipe-to-Reply Logic
+    -- Swipe-to-Reply Animation
     local startX = 0
     MsgFrame.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -354,10 +394,9 @@ local function renderMessage(msgId, sender, decryptedText, titleExp, isDM)
     end)
     MsgFrame.InputEnded:Connect(function(input)
         if startX > 0 and input.Position.X > startX + 40 then
-            -- Swipe Right Anim
-            TweenService:Create(MsgFrame, TweenInfo.new(0.2), {Position = UDim2.new(0, 90, 0, 0)}):Play()
+            TweenService:Create(MsgFrame, TweenInfo.new(0.2), {Position = UDim2.new(0, 80, 0, 0)}):Play()
             task.wait(0.3)
-            TweenService:Create(MsgFrame, TweenInfo.new(0.2), {Position = UDim2.new(0, 50, 0, 0)}):Play()
+            TweenService:Create(MsgFrame, TweenInfo.new(0.2), {Position = UDim2.new(0, 45, 0, 0)}):Play()
         end
         startX = 0
     end)
@@ -380,18 +419,17 @@ local function renderMessage(msgId, sender, decryptedText, titleExp, isDM)
 
     Container.Parent = MessageList
     
-    -- Auto smart scroll and Bubble Chat
     task.delay(0.1, smartScroll)
     showThemeBubble(sender, decryptedText)
 end
 
 --=========================================
--- LIVE POLLING (Fetching Users, Global & DMs)
+-- LIVE POLLING (Realtime Database Sync)
 --=========================================
 local lastTime = os.time()
 task.spawn(function()
     while task.wait(2) do
-        -- Fetch users for Autocomplete
+        -- Fetch users
         local sU, rU = pcall(function() return HttpService:GetAsync(FIREBASE_URL .. "users.json") end)
         if sU and rU ~= "null" then
             local usersData = HttpService:JSONDecode(rU)
@@ -399,7 +437,7 @@ task.spawn(function()
             for uname, _ in pairs(usersData) do table.insert(GlobalUsersCache, uname) end
         end
         
-        -- Fetch Global Messages
+        -- Fetch Global
         local s, r = pcall(function() return HttpService:GetAsync(FIREBASE_URL .. "messages.json") end)
         if s and r ~= "null" then
             local data = HttpService:JSONDecode(r)
