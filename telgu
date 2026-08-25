@@ -1,52 +1,953 @@
-local URL = "https://zayn-c-default-rtdb.asia-southeast1.firebasedatabase.app"
+--[[
+    RUBO — Social Interface v1.1 (Improved)
+    Single-file Roblox LocalScript
+    Main GUI: EXACTLY 400 x 350
+]]
 
-local Request =
-    (syn and syn.request)
-    or (http and http.request)
-    or http_request
-    or request
-    or (fluxus and fluxus.request)
-
-if not Request then
-    warn("RUBO FIREBASE: HTTP REQUEST FUNCTION NOT FOUND")
-    return
-end
-
+--// Services
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 
-local function Test()
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+
+--// Firebase REST Chat
+-- Replace this URL only if you use a different Firebase Realtime Database.
+local FIREBASE_URL = "https://zayn-c-default-rtdb.asia-southeast1.firebasedatabase.app"
+local FIREBASE_CHAT_PATH = "/rubochat/messages"
+local FIREBASE_POLL_INTERVAL = 2.5
+local firebaseRequest = (syn and syn.request) or (http and http.request) or request
+
+local function firebaseCall(method, path, body)
+    if not firebaseRequest then
+        return false, "HTTP request function is unavailable in this executor."
+    end
 
     local ok, response = pcall(function()
-        return Request({
-            Url = URL .. "/messages.json",
-            Method = "GET",
-            Headers = {
-                ["Content-Type"] = "application/json",
-                ["Accept"] = "application/json"
-            }
+        return firebaseRequest({
+            Url = FIREBASE_URL .. path .. ".json",
+            Method = method,
+            Headers = {["Content-Type"] = "application/json"},
+            Body = body and HttpService:JSONEncode(body) or nil
         })
     end)
 
-    if not ok then
-        warn("RUBO FIREBASE ERROR:")
-        warn(tostring(response))
+    if not ok or not response then
+        return false, "Request failed."
+    end
+
+    local code = tonumber(response.StatusCode or response.Status or 0) or 0
+    if code < 200 or code >= 300 then
+        return false, "HTTP " .. tostring(code)
+    end
+
+    local decoded
+    if response.Body and response.Body ~= "" then
+        pcall(function() decoded = HttpService:JSONDecode(response.Body) end)
+    end
+    return true, decoded
+end
+
+local function firebaseSendMessage(text)
+    text = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if text == "" or #text > 300 then return false, "Message must be 1-300 characters." end
+
+    return firebaseCall("POST", FIREBASE_CHAT_PATH, {
+        username = LocalPlayer.Name,
+        displayName = LocalPlayer.DisplayName,
+        userId = LocalPlayer.UserId,
+        text = text,
+        timestamp = os.time()
+    })
+end
+
+local function firebaseReadMessages()
+    return firebaseCall("GET", FIREBASE_CHAT_PATH)
+end
+
+--// Cleanup previous RUBO
+local old = PlayerGui:FindFirstChild("RUBO_SocialInterface")
+if old then
+    old:Destroy()
+end
+
+--// Theme Constants
+local THEME = {
+    Blue = Color3.fromRGB(40, 150, 255),
+    LightBlue = Color3.fromRGB(120, 205, 255),
+    White = Color3.fromRGB(245, 250, 255),
+    Text = Color3.fromRGB(220, 235, 250),
+    Muted = Color3.fromRGB(145, 175, 200),
+    Dark = Color3.fromRGB(5, 15, 28),
+    Panel = Color3.fromRGB(10, 35, 60),
+    Green = Color3.fromRGB(80, 220, 145),
+    Red = Color3.fromRGB(255, 100, 110)
+}
+
+local MAIN_SIZE = Vector2.new(400, 350)
+local connections = {} -- Store events for clean destruction
+
+--// Utility Functions
+local function corner(obj, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 8)
+    c.Parent = obj
+    return c
+end
+
+local function stroke(obj, color, transparency, thickness)
+    local s = Instance.new("UIStroke")
+    s.Color = color or THEME.Blue
+    s.Transparency = transparency or 0.45
+    s.Thickness = thickness or 1
+    s.Parent = obj
+    return s
+end
+
+local function tween(obj, info, props)
+    local t = TweenService:Create(obj, info, props)
+    t:Play()
+    return t
+end
+
+local function create(class, props, parent)
+    local obj = Instance.new(class)
+    for k, v in pairs(props or {}) do
+        obj[k] = v
+    end
+    obj.Parent = parent
+    return obj
+end
+
+local function notify(text)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "RUBO",
+            Text = text,
+            Duration = 3
+        })
+    end)
+end
+
+local function getAvatar(userId, size)
+    local ok, image = pcall(function()
+        return Players:GetUserThumbnailAsync(
+            userId,
+            Enum.ThumbnailType.HeadShot,
+            size or Enum.ThumbnailSize.Size100x100
+        )
+    end)
+    return ok and image or ""
+end
+
+--// GUI Initialization
+local gui = create("ScreenGui", {
+    Name = "RUBO_SocialInterface",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+}, PlayerGui)
+
+local main = create("Frame", {
+    Name = "Main",
+    Size = UDim2.fromOffset(MAIN_SIZE.X, MAIN_SIZE.Y),
+    Position = UDim2.new(0.5, 0, 0.5, 0),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = THEME.Dark,
+    BackgroundTransparency = 0.16,
+    BorderSizePixel = 0,
+    ClipsDescendants = true
+}, gui)
+
+corner(main, 12)
+stroke(main, THEME.Blue, 0.35, 1)
+
+create("UIGradient", {
+    Rotation = 125,
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(8, 30, 55)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(7, 22, 40)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(4, 12, 23))
+    }),
+    Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.12),
+        NumberSequenceKeypoint.new(1, 0.32)
+    })
+}, main)
+
+--// Header Component
+local header = create("Frame", {
+    Size = UDim2.new(1, 0, 0, 48),
+    BackgroundTransparency = 1,
+    Active = true
+}, main)
+
+create("TextLabel", {
+    Position = UDim2.fromOffset(15, 7),
+    Size = UDim2.fromOffset(110, 22),
+    BackgroundTransparency = 1,
+    Text = "RUBO",
+    Font = Enum.Font.GothamBold,
+    TextSize = 20,
+    TextColor3 = THEME.White,
+    TextXAlignment = Enum.TextXAlignment.Left
+}, header)
+
+create("TextLabel", {
+    Position = UDim2.fromOffset(16, 27),
+    Size = UDim2.fromOffset(130, 16),
+    BackgroundTransparency = 1,
+    Text = "Social Interface",
+    Font = Enum.Font.Gotham,
+    TextSize = 9,
+    TextColor3 = THEME.LightBlue,
+    TextXAlignment = Enum.TextXAlignment.Left
+}, header)
+
+-- Window Controls
+local function createControlButton(text, posOffset, textSize)
+    local btn = create("TextButton", {
+        Position = UDim2.new(1, posOffset, 0, 10),
+        Size = UDim2.fromOffset(22, 22),
+        BackgroundColor3 = THEME.Panel,
+        BackgroundTransparency = 0.25,
+        Text = text,
+        Font = Enum.Font.GothamBold,
+        TextSize = textSize,
+        TextColor3 = THEME.White,
+        AutoButtonColor = false
+    }, header)
+    corner(btn, 6)
+    stroke(btn, THEME.Blue, 0.55)
+    
+    btn.MouseEnter:Connect(function() tween(btn, TweenInfo.new(0.2), {BackgroundColor3 = THEME.Red}) end)
+    btn.MouseLeave:Connect(function() tween(btn, TweenInfo.new(0.2), {BackgroundColor3 = THEME.Panel}) end)
+    return btn
+end
+
+local minimizeBtn = createControlButton("—", -58, 15)
+local closeBtn = createControlButton("×", -31, 17)
+
+--// Navigation Bar
+local tabBar = create("ScrollingFrame", {
+    Position = UDim2.fromOffset(8, 49),
+    Size = UDim2.new(1, -16, 0, 34),
+    BackgroundColor3 = THEME.Panel,
+    BackgroundTransparency = 0.55,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 0,
+    CanvasSize = UDim2.fromOffset(0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.X,
+    ScrollingDirection = Enum.ScrollingDirection.X
+}, main)
+corner(tabBar, 8)
+
+create("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal,
+    Padding = UDim.new(0, 4),
+    VerticalAlignment = Enum.VerticalAlignment.Center
+}, tabBar)
+create("UIPadding", { PaddingLeft = UDim.new(0, 5), PaddingRight = UDim.new(0, 5) }, tabBar)
+
+--// Content Area
+local content = create("Frame", {
+    Position = UDim2.fromOffset(8, 88),
+    Size = UDim2.new(1, -16, 1, -96),
+    BackgroundTransparency = 1,
+    ClipsDescendants = true
+}, main)
+
+--// UI Element Builders
+local pages = {}
+local function createPage(name)
+    local page = create("ScrollingFrame", {
+        Name = name,
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 2,
+        ScrollBarImageColor3 = THEME.Blue,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        Visible = false
+    }, content)
+    pages[name] = page
+    return page
+end
+
+local function label(parent, text, pos, size, textSize, color)
+    return create("TextLabel", {
+        Position = pos,
+        Size = size,
+        BackgroundTransparency = 1,
+        Text = text,
+        Font = Enum.Font.Gotham,
+        TextSize = textSize or 12,
+        TextColor3 = color or THEME.Text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Center
+    }, parent)
+end
+
+local function button(parent, text, pos, size)
+    local b = create("TextButton", {
+        Position = pos,
+        Size = size,
+        BackgroundColor3 = THEME.Panel,
+        BackgroundTransparency = 0.22,
+        BorderSizePixel = 0,
+        Text = text,
+        Font = Enum.Font.GothamSemibold,
+        TextSize = 11,
+        TextColor3 = THEME.White,
+        AutoButtonColor = false
+    }, parent)
+    corner(b, 7)
+    stroke(b, THEME.Blue, 0.58)
+
+    b.MouseEnter:Connect(function() tween(b, TweenInfo.new(0.15), {BackgroundTransparency = 0.02}) end)
+    b.MouseLeave:Connect(function() tween(b, TweenInfo.new(0.15), {BackgroundTransparency = 0.22}) end)
+    b.Activated:Connect(function()
+        tween(b, TweenInfo.new(0.05), {Size = UDim2.new(size.X.Scale, size.X.Offset - 2, size.Y.Scale, size.Y.Offset - 2)})
+        task.delay(0.05, function() if b.Parent then tween(b, TweenInfo.new(0.1), {Size = size}) end end)
+    end)
+    return b
+end
+
+local function panel(parent, pos, size)
+    local p = create("Frame", {
+        Position = pos,
+        Size = size,
+        BackgroundColor3 = THEME.Panel,
+        BackgroundTransparency = 0.48,
+        BorderSizePixel = 0
+    }, parent)
+    corner(p, 9)
+    stroke(p, THEME.Blue, 0.72)
+    return p
+end
+
+--========================================================
+-- PAGE CONFIGURATIONS
+--========================================================
+
+-- HOME
+local home = createPage("Home")
+label(home, "WELCOME TO RUBO", UDim2.fromOffset(10, 7), UDim2.fromOffset(250, 24), 17, THEME.White)
+label(home, "Minimal social interface", UDim2.fromOffset(11, 30), UDim2.fromOffset(250, 18), 10, THEME.Muted)
+
+local homeCard = panel(home, UDim2.fromOffset(8, 55), UDim2.new(1, -16, 0, 106))
+local homeAvatar = create("ImageLabel", {
+    Position = UDim2.fromOffset(12, 15),
+    Size = UDim2.fromOffset(58, 58),
+    BackgroundColor3 = THEME.Panel,
+    BackgroundTransparency = 0.2,
+    Image = getAvatar(LocalPlayer.UserId)
+}, homeCard)
+corner(homeAvatar, 29)
+
+label(homeCard, LocalPlayer.DisplayName, UDim2.fromOffset(82, 13), UDim2.fromOffset(200, 22), 14, THEME.White)
+label(homeCard, "@" .. LocalPlayer.Name, UDim2.fromOffset(82, 35), UDim2.fromOffset(200, 17), 10, THEME.Muted)
+label(homeCard, "● Online", UDim2.fromOffset(82, 55), UDim2.fromOffset(100, 18), 10, THEME.Green)
+label(homeCard, "Followers: —     Following: —", UDim2.fromOffset(82, 75), UDim2.fromOffset(250, 18), 10, THEME.Text)
+
+local hp1 = button(home, "Profile", UDim2.fromOffset(8, 171), UDim2.fromOffset(116, 35))
+local hp2 = button(home, "Friends", UDim2.fromOffset(132, 171), UDim2.fromOffset(116, 35))
+local hp3 = button(home, "Leaderboard", UDim2.fromOffset(256, 171), UDim2.fromOffset(116, 35))
+local hp4 = button(home, "Search", UDim2.fromOffset(8, 212), UDim2.fromOffset(176, 35))
+local hp5 = button(home, "Live Chat", UDim2.fromOffset(192, 212), UDim2.fromOffset(180, 35))
+
+-- PROFILE
+local profile = createPage("Profile")
+label(profile, "PROFILE", UDim2.fromOffset(10, 7), UDim2.fromOffset(250, 22), 17, THEME.White)
+local profileCard = panel(profile, UDim2.fromOffset(8, 38), UDim2.new(1, -16, 0, 160))
+local profileAvatar = create("ImageLabel", {
+    Position = UDim2.fromOffset(14, 16),
+    Size = UDim2.fromOffset(70, 70),
+    BackgroundColor3 = THEME.Panel,
+    Image = getAvatar(LocalPlayer.UserId)
+}, profileCard)
+corner(profileAvatar, 35)
+
+label(profileCard, LocalPlayer.DisplayName, UDim2.fromOffset(98, 15), UDim2.fromOffset(240, 23), 15, THEME.White)
+label(profileCard, "@" .. LocalPlayer.Name, UDim2.fromOffset(98, 38), UDim2.fromOffset(240, 18), 10, THEME.Muted)
+label(profileCard, "User ID: " .. LocalPlayer.UserId, UDim2.fromOffset(98, 57), UDim2.fromOffset(240, 18), 9, THEME.Text)
+label(profileCard, "● Online", UDim2.fromOffset(98, 77), UDim2.fromOffset(100, 18), 10, THEME.Green)
+
+local followButton = button(profileCard, "Follow", UDim2.fromOffset(14, 126), UDim2.fromOffset(100, 26))
+local followStatus = label(profileCard, "Not Following • Roblox follow API unavailable here", UDim2.fromOffset(124, 126), UDim2.fromOffset(220, 26), 8, THEME.Muted)
+followButton.Activated:Connect(function()
+    followStatus.Text = "Follow action unavailable in this LocalScript environment."
+    followButton.Text = "Follow"
+    notify("Roblox follow action unavailable here.")
+end)
+
+-- FRIENDS
+local friends = createPage("Friends")
+label(friends, "FRIENDS", UDim2.fromOffset(10, 7), UDim2.fromOffset(250, 22), 17, THEME.White)
+local friendStatus = label(friends, "Loading Roblox friends...", UDim2.fromOffset(10, 31), UDim2.fromOffset(350, 20), 9, THEME.Muted)
+
+local friendContainer = create("Frame", {
+    Position = UDim2.fromOffset(8, 55),
+    Size = UDim2.new(1, -16, 0, 400),
+    BackgroundTransparency = 1
+}, friends)
+create("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder}, friendContainer)
+
+task.spawn(function()
+    local ok, pagesObject = pcall(function() return Players:GetFriendsAsync(LocalPlayer.UserId) end)
+    if not ok then friendStatus.Text = "Friends API unavailable." return end
+    local count = 0
+    repeat
+        for _, friend in ipairs(pagesObject:GetCurrentPage()) do
+            count += 1
+            local row = panel(friendContainer, UDim2.new(0, 0, 0, 0), UDim2.new(1, 0, 0, 54))
+            row.LayoutOrder = count
+            local img = create("ImageLabel", {
+                Position = UDim2.fromOffset(7, 7), Size = UDim2.fromOffset(40, 40),
+                BackgroundColor3 = THEME.Panel, Image = getAvatar(friend.Id)
+            }, row)
+            corner(img, 20)
+            label(row, friend.DisplayName or friend.Username, UDim2.fromOffset(56, 7), UDim2.fromOffset(145, 18), 10, THEME.White)
+            label(row, "@" .. (friend.Username or ""), UDim2.fromOffset(56, 25), UDim2.fromOffset(145, 16), 8, THEME.Muted)
+            label(row, "Friend", UDim2.fromOffset(205, 17), UDim2.fromOffset(45, 18), 8, THEME.Green)
+        end
+        if pagesObject.IsFinished then break end
+        if not pcall(function() pagesObject:AdvanceToNextPageAsync() end) then break end
+    until false
+    friendStatus.Text = count > 0 and tostring(count) .. " friend(s) loaded" or "No friends found."
+end)
+
+
+
+-- SEARCH
+local search = createPage("Search")
+label(search, "SEARCH USERS", UDim2.fromOffset(10, 7), UDim2.fromOffset(260, 22), 17, THEME.White)
+label(search, "Search Roblox users by username", UDim2.fromOffset(10, 30), UDim2.fromOffset(350, 18), 9, THEME.Muted)
+
+local searchBox = create("TextBox", {
+    Position = UDim2.fromOffset(8, 55),
+    Size = UDim2.new(1, -78, 0, 36),
+    BackgroundColor3 = THEME.Panel,
+    BackgroundTransparency = 0.2,
+    BorderSizePixel = 0,
+    PlaceholderText = "Search Roblox User",
+    PlaceholderColor3 = THEME.Muted,
+    Text = "",
+    ClearTextOnFocus = false,
+    TextColor3 = THEME.White,
+    Font = Enum.Font.Gotham,
+    TextSize = 10,
+    TextXAlignment = Enum.TextXAlignment.Left
+}, search)
+corner(searchBox, 7)
+stroke(searchBox, THEME.Blue, 0.6)
+
+local searchBtn = button(search, "SEARCH", UDim2.new(1, -62, 0, 55), UDim2.fromOffset(54, 36))
+local searchStatus = label(search, "Enter a username to search.", UDim2.fromOffset(10, 96), UDim2.fromOffset(350, 20), 9, THEME.Muted)
+local searchResult = panel(search, UDim2.fromOffset(8, 122), UDim2.new(1, -16, 0, 118))
+searchResult.Visible = false
+
+local searchAvatar = create("ImageLabel", {
+    Position = UDim2.fromOffset(10, 12),
+    Size = UDim2.fromOffset(62, 62),
+    BackgroundColor3 = THEME.Panel,
+    BackgroundTransparency = 0.2
+}, searchResult)
+corner(searchAvatar, 31)
+
+local searchName = label(searchResult, "", UDim2.fromOffset(84, 10), UDim2.fromOffset(230, 20), 13, THEME.White)
+local searchUsername = label(searchResult, "", UDim2.fromOffset(84, 31), UDim2.fromOffset(230, 18), 9, THEME.Muted)
+local searchUserId = label(searchResult, "", UDim2.fromOffset(84, 49), UDim2.fromOffset(230, 18), 8, THEME.Text)
+local searchFollowStatus = label(searchResult, "Follow status unavailable until supported by the environment.", UDim2.fromOffset(84, 67), UDim2.fromOffset(250, 18), 8, THEME.Muted)
+local searchFollow = button(searchResult, "Follow", UDim2.fromOffset(10, 84), UDim2.fromOffset(100, 26))
+searchFollow.Activated:Connect(function()
+    searchFollowStatus.Text = "Roblox follow action is not available from this LocalScript environment."
+    notify("Follow action unavailable here.")
+end)
+
+local function doUserSearch()
+    local query = searchBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+    if query == "" then
+        searchResult.Visible = false
+        searchStatus.Text = "Enter a username to search."
         return
     end
 
-    print("========== RUBO FIREBASE ==========")
-    print("Status:", response.StatusCode)
-    print("Body:", tostring(response.Body))
-    print("===================================")
+    searchStatus.Text = "Searching..."
+    local ok, userId = pcall(function()
+        return Players:GetUserIdFromNameAsync(query)
+    end)
 
-    if response.StatusCode == 200 then
-        print("RUBO: FIREBASE CONNECTED ✓")
-    elseif response.StatusCode == 401 then
-        warn("RUBO: FIREBASE RULES BLOCKING REQUEST")
-    elseif response.StatusCode == 404 then
-        warn("RUBO: FIREBASE DATABASE URL INVALID")
-    else
-        warn("RUBO: FIREBASE HTTP ERROR " .. tostring(response.StatusCode))
+    if not ok or not userId then
+        searchResult.Visible = false
+        searchStatus.Text = "User not found."
+        return
+    end
+
+    local okName, username = pcall(function()
+        return Players:GetNameFromUserIdAsync(userId)
+    end)
+
+    searchAvatar.Image = getAvatar(userId)
+    searchName.Text = okName and username or query
+    searchUsername.Text = "@" .. (okName and username or query)
+    searchUserId.Text = "User ID: " .. tostring(userId)
+    searchFollowStatus.Text = "Follow status must be confirmed by a supported server/API."
+    searchResult.Visible = true
+    searchStatus.Text = "User found."
+end
+
+searchBtn.Activated:Connect(doUserSearch)
+searchBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed then doUserSearch() end
+end)
+
+-- CHAT
+local chat = createPage("Chat")
+label(chat, "LIVE CHAT", UDim2.fromOffset(10, 7), UDim2.fromOffset(250, 22), 17, THEME.White)
+local chatStatus = label(chat, "Connecting to Firebase...", UDim2.fromOffset(10, 30), UDim2.fromOffset(350, 18), 9, THEME.Muted)
+
+local chatList = create("ScrollingFrame", {
+    Position = UDim2.fromOffset(8, 53),
+    Size = UDim2.new(1, -16, 1, -100),
+    BackgroundColor3 = THEME.Panel,
+    BackgroundTransparency = 0.55,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 2,
+    ScrollBarImageColor3 = THEME.Blue,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y
+}, chat)
+corner(chatList, 8)
+create("UIListLayout", {
+    Padding = UDim.new(0, 5),
+    SortOrder = Enum.SortOrder.LayoutOrder
+}, chatList)
+create("UIPadding", {
+    PaddingTop = UDim.new(0, 6),
+    PaddingLeft = UDim.new(0, 6),
+    PaddingRight = UDim.new(0, 6),
+    PaddingBottom = UDim.new(0, 6)
+}, chatList)
+
+local chatInput = create("TextBox", {
+    Position = UDim2.fromOffset(8, 0),
+    Size = UDim2.new(1, -78, 0, 34),
+    BackgroundColor3 = THEME.Panel,
+    BackgroundTransparency = 0.2,
+    BorderSizePixel = 0,
+    PlaceholderText = "Type a message...",
+    PlaceholderColor3 = THEME.Muted,
+    Text = "",
+    ClearTextOnFocus = false,
+    TextColor3 = THEME.White,
+    Font = Enum.Font.Gotham,
+    TextSize = 10,
+    TextXAlignment = Enum.TextXAlignment.Left
+}, chat)
+corner(chatInput, 7)
+stroke(chatInput, THEME.Blue, 0.6)
+
+local sendChat = button(chat, "SEND", UDim2.new(1, -62, 0, 0), UDim2.fromOffset(54, 34))
+
+local function clearChatRows()
+    for _, child in ipairs(chatList:GetChildren()) do
+        if child:IsA("Frame") then child:Destroy() end
     end
 end
 
-Test()
+local function addChatRow(item, order)
+    local row = panel(chatList, UDim2.new(), UDim2.new(1, -12, 0, 54))
+    row.LayoutOrder = order
+
+    local name = tostring(item.displayName or item.username or "Unknown")
+    local text = tostring(item.text or "")
+    label(row, name, UDim2.fromOffset(8, 5), UDim2.new(1, -16, 0, 17), 10, THEME.LightBlue)
+    label(row, text, UDim2.fromOffset(8, 23), UDim2.new(1, -16, 0, 24), 9, THEME.Text)
+end
+
+local lastChatSignature = ""
+local function refreshChat()
+    local ok, data = firebaseReadMessages()
+    if not ok then
+        chatStatus.Text = "Firebase: " .. tostring(data)
+        return
+    end
+
+    clearChatRows()
+    local items = {}
+
+    if type(data) == "table" then
+        for key, item in pairs(data) do
+            if type(item) == "table" then
+                item._key = tostring(key)
+                table.insert(items, item)
+            end
+        end
+    end
+
+    table.sort(items, function(a, b)
+        return tonumber(a.timestamp or 0) < tonumber(b.timestamp or 0)
+    end)
+
+    -- Keep the UI lightweight.
+    local startIndex = math.max(1, #items - 30 + 1)
+    local signatureParts = {}
+    for i = startIndex, #items do
+        table.insert(signatureParts, tostring(items[i]._key) .. ":" .. tostring(items[i].text))
+    end
+    local signature = table.concat(signatureParts, "|")
+
+    if signature ~= lastChatSignature then
+        for i = startIndex, #items do
+            addChatRow(items[i], i)
+        end
+        lastChatSignature = signature
+        task.defer(function()
+            pcall(function()
+                chatList.CanvasPosition = Vector2.new(0, math.max(0, chatList.AbsoluteCanvasSize.Y))
+            end)
+        end)
+    end
+
+    chatStatus.Text = "Firebase connected • " .. tostring(#items) .. " message(s)"
+end
+
+local sending = false
+local function sendCurrentChat()
+    if sending then return end
+    local text = chatInput.Text
+    if text:gsub("%s", "") == "" then return end
+
+    sending = true
+    sendChat.Text = "..."
+    local ok, err = firebaseSendMessage(text)
+    if ok then
+        chatInput.Text = ""
+        chatStatus.Text = "Message sent."
+        task.spawn(refreshChat)
+    else
+        chatStatus.Text = tostring(err)
+        notify("Chat error: " .. tostring(err))
+    end
+    sendChat.Text = "SEND"
+    sending = false
+end
+
+sendChat.Activated:Connect(sendCurrentChat)
+chatInput.FocusLost:Connect(function(enterPressed)
+    if enterPressed then sendCurrentChat() end
+end)
+
+task.spawn(function()
+    while gui and gui.Parent do
+        if main.Visible then
+            refreshChat()
+        end
+        task.wait(FIREBASE_POLL_INTERVAL)
+    end
+end)
+
+
+-- SCRIPTS
+local scriptsPage = createPage("Scripts")
+label(scriptsPage, "LUA EDITOR", UDim2.fromOffset(10, 7), UDim2.fromOffset(260, 22), 17, THEME.White)
+label(scriptsPage, "Write and manage Lua text in the RUBO editor.", UDim2.fromOffset(10, 30), UDim2.fromOffset(350, 18), 9, THEME.Muted)
+
+local editor = create("TextBox", {
+    Position = UDim2.fromOffset(8, 55),
+    Size = UDim2.new(1, -16, 0, 190),
+    BackgroundColor3 = Color3.fromRGB(4, 12, 23),
+    BackgroundTransparency = 0.18,
+    BorderSizePixel = 0,
+    Text = "-- RUBO Lua Editor\n",
+    ClearTextOnFocus = false,
+    MultiLine = true,
+    TextWrapped = false,
+    TextColor3 = THEME.Text,
+    Font = Enum.Font.Code,
+    TextSize = 10,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top
+}, scriptsPage)
+corner(editor, 8)
+stroke(editor, THEME.Blue, 0.65)
+
+local executeBtn = button(scriptsPage, "EXECUTE", UDim2.fromOffset(8, 252), UDim2.fromOffset(105, 32))
+local clearBtn = button(scriptsPage, "CLEAR", UDim2.fromOffset(119, 252), UDim2.fromOffset(105, 32))
+local copyBtn = button(scriptsPage, "COPY", UDim2.fromOffset(230, 252), UDim2.fromOffset(105, 32))
+local editorStatus = label(scriptsPage, "Editor ready.", UDim2.fromOffset(8, 287), UDim2.fromOffset(350, 20), 9, THEME.Muted)
+
+clearBtn.Activated:Connect(function()
+    editor.Text = ""
+    editorStatus.Text = "Editor cleared."
+end)
+
+copyBtn.Activated:Connect(function()
+    if setclipboard then
+        local ok = pcall(setclipboard, editor.Text)
+        editorStatus.Text = ok and "Copied to clipboard." or "Clipboard unavailable."
+    else
+        editorStatus.Text = "Clipboard unavailable in this environment."
+    end
+end)
+
+-- Deliberately do not execute arbitrary executor payloads here.
+executeBtn.Activated:Connect(function()
+    editorStatus.Text = "Execution is unavailable in this safe GUI editor."
+    notify("Editor execution is unavailable.")
+end)
+
+-- SETTINGS
+local settings = createPage("Settings")
+label(settings, "SETTINGS", UDim2.fromOffset(10, 7), UDim2.fromOffset(250, 22), 17, THEME.White)
+label(settings, "Simple controls for the RUBO interface.", UDim2.fromOffset(10, 30), UDim2.fromOffset(350, 18), 9, THEME.Muted)
+
+local transparencyLabel = label(settings, "UI Transparency", UDim2.fromOffset(10, 62), UDim2.fromOffset(180, 22), 11, THEME.White)
+local transparencyValue = label(settings, "16%", UDim2.fromOffset(290, 62), UDim2.fromOffset(70, 22), 10, THEME.LightBlue)
+local transparencySlider = create("TextButton", {
+    Position = UDim2.fromOffset(10, 88),
+    Size = UDim2.new(1, -20, 0, 20),
+    BackgroundColor3 = THEME.Panel,
+    BackgroundTransparency = 0.25,
+    BorderSizePixel = 0,
+    Text = "",
+    AutoButtonColor = false
+}, settings)
+corner(transparencySlider, 10)
+local transparencyFill = create("Frame", {
+    Size = UDim2.new(0.16, 0, 1, 0),
+    BackgroundColor3 = THEME.Blue,
+    BorderSizePixel = 0
+}, transparencySlider)
+corner(transparencyFill, 10)
+
+local animationsOn = true
+local soundOn = false
+
+local function settingToggle(parent, y, title, initial)
+    local state = initial
+    local row = panel(parent, UDim2.fromOffset(8, y), UDim2.new(1, -16, 0, 48))
+    label(row, title, UDim2.fromOffset(10, 0), UDim2.new(1, -80, 1, 0), 10, THEME.White)
+    local t = button(row, state and "ON" or "OFF", UDim2.new(1, -64, 0, 8), UDim2.fromOffset(54, 32))
+    t.Activated:Connect(function()
+        state = not state
+        t.Text = state and "ON" or "OFF"
+        if title == "Animations" then animationsOn = state end
+        if title == "Sound" then soundOn = state end
+    end)
+    return row
+end
+
+settingToggle(settings, 120, "Animations", true)
+settingToggle(settings, 176, "Sound", false)
+
+local sizeStatus = label(settings, "UI Size: 400 × 350 (fixed base size)", UDim2.fromOffset(10, 238), UDim2.fromOffset(350, 22), 10, THEME.Text)
+
+transparencySlider.Activated:Connect(function()
+    local mouse = UserInputService:GetMouseLocation()
+    local x = math.clamp(mouse.X - transparencySlider.AbsolutePosition.X, 0, transparencySlider.AbsoluteSize.X)
+    local ratio = x / math.max(1, transparencySlider.AbsoluteSize.X)
+    transparencyFill.Size = UDim2.new(ratio, 0, 1, 0)
+    main.BackgroundTransparency = math.clamp(ratio, 0.05, 0.8)
+    transparencyValue.Text = tostring(math.floor(ratio * 100)) .. "%"
+end)
+
+-- ABOUT
+local about = createPage("About")
+label(about, "ABOUT RUBO", UDim2.fromOffset(10, 7), UDim2.fromOffset(260, 22), 17, THEME.White)
+local aboutCard = panel(about, UDim2.fromOffset(8, 42), UDim2.new(1, -16, 0, 185))
+label(aboutCard, "RUBO", UDim2.fromOffset(14, 15), UDim2.fromOffset(300, 28), 21, THEME.White)
+label(aboutCard, "Social Interface", UDim2.fromOffset(15, 42), UDim2.fromOffset(300, 18), 10, THEME.LightBlue)
+label(aboutCard, "Blue • Transparent • Minimal", UDim2.fromOffset(15, 75), UDim2.fromOffset(300, 20), 10, THEME.Text)
+label(aboutCard, "Profile, friends, search, chat and utility tabs.", UDim2.fromOffset(15, 100), UDim2.fromOffset(330, 20), 9, THEME.Muted)
+label(aboutCard, "Version: 2.0", UDim2.fromOffset(15, 130), UDim2.fromOffset(300, 20), 9, THEME.Muted)
+
+-- LEADERBOARD (Dynamic)
+local leaderboard = createPage("Leaderboard")
+label(leaderboard, "RUBO LEADERBOARD", UDim2.fromOffset(10, 7), UDim2.fromOffset(280, 22), 16, THEME.White)
+local leaderContainer = create("Frame", {
+    Position = UDim2.fromOffset(8, 35),
+    Size = UDim2.new(1, -16, 1, -40),
+    BackgroundTransparency = 1
+}, leaderboard)
+create("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.Name}, leaderContainer)
+
+local function updateLeaderboard()
+    for _, child in ipairs(leaderContainer:GetChildren()) do
+        if child:IsA("Frame") then child:Destroy() end
+    end
+    for i, p in ipairs(Players:GetPlayers()) do
+        local row = panel(leaderContainer, UDim2.new(), UDim2.new(1, 0, 0, 48))
+        row.Name = string.format("%03d", i) -- Simple alphabetical sorting trick
+        if p == LocalPlayer then row.BackgroundTransparency = 0.18 end
+        
+        label(row, "#"..i, UDim2.fromOffset(8, 0), UDim2.fromOffset(28, 48), 11, THEME.LightBlue)
+        local img = create("ImageLabel", {
+            Position = UDim2.fromOffset(40, 5), Size = UDim2.fromOffset(38, 38),
+            BackgroundTransparency = 1, Image = getAvatar(p.UserId)
+        }, row)
+        corner(img, 19)
+        label(row, p.DisplayName, UDim2.fromOffset(86, 7), UDim2.fromOffset(130, 17), 10, THEME.White)
+        label(row, "@" .. p.Name, UDim2.fromOffset(86, 25), UDim2.fromOffset(130, 15), 8, THEME.Muted)
+    end
+end
+
+table.insert(connections, Players.PlayerAdded:Connect(updateLeaderboard))
+table.insert(connections, Players.PlayerRemoving:Connect(updateLeaderboard))
+updateLeaderboard() -- Initial run
+
+--========================================================
+-- TAB SYSTEM & NAVIGATION
+--========================================================
+local tabNames = {"Home", "Profile", "Friends", "Search", "Chat", "Scripts", "Settings", "About", "Leaderboard"}
+local tabButtons = {}
+
+local function showPage(name)
+    for pageName, page in pairs(pages) do
+        if pageName == name then
+            page.Visible = true
+            tween(page, TweenInfo.new(0.2, Enum.EasingStyle.Sine), {ScrollBarImageTransparency = 0})
+        else
+            page.Visible = false
+        end
+    end
+
+    for tabName, tab in pairs(tabButtons) do
+        if tabName == name then
+            tween(tab, TweenInfo.new(0.2), {BackgroundTransparency = 0.05, TextColor3 = THEME.White})
+        else
+            tween(tab, TweenInfo.new(0.2), {BackgroundTransparency = 0.55, TextColor3 = THEME.Muted})
+        end
+    end
+end
+
+for _, tabName in ipairs(tabNames) do
+    local b = create("TextButton", {
+        Size = UDim2.fromOffset(math.max(57, #tabName * 7 + 22), 26),
+        BackgroundColor3 = THEME.Panel,
+        BackgroundTransparency = 0.55,
+        BorderSizePixel = 0,
+        Text = tabName,
+        Font = Enum.Font.GothamSemibold,
+        TextSize = 9,
+        TextColor3 = THEME.Muted,
+        AutoButtonColor = false
+    }, tabBar)
+    corner(b, 6)
+    stroke(b, THEME.Blue, 0.78)
+    tabButtons[tabName] = b
+
+    b.MouseEnter:Connect(function() if not pages[tabName].Visible then tween(b, TweenInfo.new(0.2), {BackgroundTransparency = 0.3}) end end)
+    b.MouseLeave:Connect(function() if not pages[tabName].Visible then tween(b, TweenInfo.new(0.2), {BackgroundTransparency = 0.55}) end end)
+    b.Activated:Connect(function() showPage(tabName) end)
+end
+
+hp1.Activated:Connect(function() showPage("Profile") end)
+hp2.Activated:Connect(function() showPage("Friends") end)
+hp3.Activated:Connect(function() showPage("Leaderboard") end)
+hp4.Activated:Connect(function() showPage("Search") end)
+hp5.Activated:Connect(function() showPage("Chat") end)
+
+--========================================================
+-- WINDOW DRAGGING (Improved)
+--========================================================
+local dragToggle = nil
+local dragSpeed = 0.15
+local dragStart = nil
+local startPos = nil
+
+local function updateInput(input)
+    local delta = input.Position - dragStart
+    local position = UDim2.new(
+        startPos.X.Scale, startPos.X.Offset + delta.X,
+        startPos.Y.Scale, startPos.Y.Offset + delta.Y
+    )
+    tween(main, TweenInfo.new(dragSpeed), {Position = position})
+end
+
+header.InputBegan:Connect(function(input)
+    if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+        dragToggle = true
+        dragStart = input.Position
+        startPos = main.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragToggle = false end
+        end)
+    end
+end)
+
+table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        if dragToggle then updateInput(input) end
+    end
+end))
+
+--========================================================
+-- FLOATING BUTTON / MINIMIZE
+--========================================================
+local floating = create("TextButton", {
+    Name = "RUBO_Floating",
+    Size = UDim2.fromOffset(48, 48),
+    Position = UDim2.new(1, -62, 0.5, -24),
+    BackgroundColor3 = THEME.Blue,
+    BackgroundTransparency = 0.28,
+    BorderSizePixel = 0,
+    Text = "R",
+    Font = Enum.Font.GothamBold,
+    TextSize = 20,
+    TextColor3 = THEME.White,
+    Visible = false,
+    AutoButtonColor = false
+}, gui)
+corner(floating, 24)
+stroke(floating, THEME.LightBlue, 0.25, 1)
+
+local floatDragToggle = false
+local floatDragStart, floatStartPos
+
+floating.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        floatDragToggle = true
+        floatDragStart = input.Position
+        floatStartPos = floating.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then floatDragToggle = false end
+        end)
+    end
+end)
+
+table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+    if floatDragToggle and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - floatDragStart
+        floating.Position = UDim2.new(floatStartPos.X.Scale, floatStartPos.X.Offset + delta.X, floatStartPos.Y.Scale, floatStartPos.Y.Offset + delta.Y)
+    end
+end))
+
+floating.Activated:Connect(function()
+    floating.Visible = false
+    main.Visible = true
+    main.Size = UDim2.fromOffset(MAIN_SIZE.X, MAIN_SIZE.Y)
+    main.BackgroundTransparency = 0.16
+end)
+
+minimizeBtn.Activated:Connect(function()
+    -- Hide only; do not resize/destroy/cut the GUI.
+    main.Visible = false
+    floating.Visible = true
+end)
+
+--========================================================
+-- STARTUP
+--========================================================
+main.Size = UDim2.fromOffset(MAIN_SIZE.X, MAIN_SIZE.Y)
+main.BackgroundTransparency = 0.16
+
+showPage("Home")
+notify("RUBO Social Interface v1.1 Loaded.")
