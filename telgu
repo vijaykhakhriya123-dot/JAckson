@@ -202,7 +202,7 @@ create("TextLabel", {
     Position = UDim2.fromOffset(16, 27),
     Size = UDim2.fromOffset(130, 16),
     BackgroundTransparency = 1,
-    Text = "Social Interface",
+    Text = "Social Chat Interface",
     Font = Enum.Font.Gotham,
     TextSize = 9,
     TextColor3 = THEME.LightBlue,
@@ -380,17 +380,26 @@ label(profileCard, "User ID: " .. LocalPlayer.UserId, UDim2.fromOffset(98, 57), 
 label(profileCard, "● Online", UDim2.fromOffset(98, 77), UDim2.fromOffset(100, 18), 10, THEME.Green)
 
 local followButton = button(profileCard, "Follow", UDim2.fromOffset(14, 126), UDim2.fromOffset(100, 26))
-local followStatus = label(profileCard, "Not Following • Roblox follow API unavailable here", UDim2.fromOffset(124, 126), UDim2.fromOffset(220, 26), 8, THEME.Muted)
+local followStatus = label(profileCard, "RUBO follow state: OFF", UDim2.fromOffset(124, 126), UDim2.fromOffset(220, 26), 8, THEME.Muted)
+local followingLocal = false
 followButton.Activated:Connect(function()
-    followStatus.Text = "Follow action unavailable in this LocalScript environment."
-    followButton.Text = "Follow"
-    notify("Roblox follow action unavailable here.")
+    followingLocal = not followingLocal
+    followButton.Text = followingLocal and "Following" or "Follow"
+    followStatus.Text = followingLocal and "RUBO follow state: ON" or "RUBO follow state: OFF"
 end)
 
 -- FRIENDS
 local friends = createPage("Friends")
 label(friends, "FRIENDS", UDim2.fromOffset(10, 7), UDim2.fromOffset(250, 22), 17, THEME.White)
 local friendStatus = label(friends, "Loading Roblox friends...", UDim2.fromOffset(10, 31), UDim2.fromOffset(350, 20), 9, THEME.Muted)
+local inviteFriends = button(friends, "INVITE FRIENDS", UDim2.new(1, -132, 0, 5), UDim2.fromOffset(122, 28))
+inviteFriends.Activated:Connect(function()
+    local ok = pcall(function()
+        local SocialService = game:GetService("SocialService")
+        SocialService:PromptGameInvite(LocalPlayer)
+    end)
+    if not ok then notify("Friend invite is not available in this experience.") end
+end)
 
 local friendContainer = create("Frame", {
     Position = UDim2.fromOffset(8, 55),
@@ -464,11 +473,13 @@ corner(searchAvatar, 31)
 local searchName = label(searchResult, "", UDim2.fromOffset(84, 10), UDim2.fromOffset(230, 20), 13, THEME.White)
 local searchUsername = label(searchResult, "", UDim2.fromOffset(84, 31), UDim2.fromOffset(230, 18), 9, THEME.Muted)
 local searchUserId = label(searchResult, "", UDim2.fromOffset(84, 49), UDim2.fromOffset(230, 18), 8, THEME.Text)
-local searchFollowStatus = label(searchResult, "Follow status unavailable until supported by the environment.", UDim2.fromOffset(84, 67), UDim2.fromOffset(250, 18), 8, THEME.Muted)
+local searchFollowStatus = label(searchResult, "Follow this user from RUBO.", UDim2.fromOffset(84, 67), UDim2.fromOffset(250, 18), 8, THEME.Muted)
 local searchFollow = button(searchResult, "Follow", UDim2.fromOffset(10, 84), UDim2.fromOffset(100, 26))
+local searchFollowing = false
 searchFollow.Activated:Connect(function()
-    searchFollowStatus.Text = "Roblox follow action is not available from this LocalScript environment."
-    notify("Follow action unavailable here.")
+    searchFollowing = not searchFollowing
+    searchFollow.Text = searchFollowing and "Following" or "Follow"
+    searchFollowStatus.Text = searchFollowing and "RUBO follow state: ON" or "RUBO follow state: OFF"
 end)
 
 local function doUserSearch()
@@ -510,112 +521,107 @@ end)
 
 -- CHAT
 local chat = createPage("Chat")
-label(chat, "LIVE CHAT", UDim2.fromOffset(10, 7), UDim2.fromOffset(250, 22), 17, THEME.White)
-local chatStatus = label(chat, "Connecting to Firebase...", UDim2.fromOffset(10, 30), UDim2.fromOffset(350, 18), 9, THEME.Muted)
+label(chat, "RUBO CHAT", UDim2.fromOffset(10, 5), UDim2.fromOffset(250, 22), 17, THEME.White)
+local chatStatus = label(chat, "Connecting to Firebase...", UDim2.fromOffset(10, 27), UDim2.fromOffset(350, 18), 9, THEME.Muted)
+
+-- Reply/private target state
+local replyTo = nil
+local privateTarget = nil
+local touchStarts = {}
 
 local chatList = create("ScrollingFrame", {
-    Position = UDim2.fromOffset(8, 53),
-    Size = UDim2.new(1, -16, 1, -100),
-    BackgroundColor3 = THEME.Panel,
-    BackgroundTransparency = 0.55,
-    BorderSizePixel = 0,
-    ScrollBarThickness = 2,
-    ScrollBarImageColor3 = THEME.Blue,
-    CanvasSize = UDim2.new(0, 0, 0, 0),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y
+    Position = UDim2.fromOffset(8, 48), Size = UDim2.new(1, -16, 1, -102),
+    BackgroundColor3 = THEME.Panel, BackgroundTransparency = 0.55, BorderSizePixel = 0,
+    ScrollBarThickness = 2, ScrollBarImageColor3 = THEME.Blue,
+    CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y
 }, chat)
 corner(chatList, 8)
-create("UIListLayout", {
-    Padding = UDim.new(0, 5),
-    SortOrder = Enum.SortOrder.LayoutOrder
-}, chatList)
-create("UIPadding", {
-    PaddingTop = UDim.new(0, 6),
-    PaddingLeft = UDim.new(0, 6),
-    PaddingRight = UDim.new(0, 6),
-    PaddingBottom = UDim.new(0, 6)
-}, chatList)
+create("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder}, chatList)
+create("UIPadding", {PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6)}, chatList)
+
+local replyBar = panel(chat, UDim2.fromOffset(8, 0), UDim2.new(1, -16, 0, 24))
+replyBar.Visible = false
+local replyLabel = label(replyBar, "", UDim2.fromOffset(8, 3), UDim2.new(1, -38, 0, 18), 8, THEME.LightBlue)
+local replyClose = button(replyBar, "×", UDim2.new(1, -28, 0, 1), UDim2.fromOffset(22, 22))
+replyClose.Activated:Connect(function()
+    replyTo = nil; privateTarget = nil; replyBar.Visible = false
+end)
 
 local chatInput = create("TextBox", {
-    Position = UDim2.fromOffset(8, 0),
-    Size = UDim2.new(1, -78, 0, 34),
-    BackgroundColor3 = THEME.Panel,
-    BackgroundTransparency = 0.2,
-    BorderSizePixel = 0,
-    PlaceholderText = "Type a message...",
-    PlaceholderColor3 = THEME.Muted,
-    Text = "",
-    ClearTextOnFocus = false,
-    TextColor3 = THEME.White,
-    Font = Enum.Font.Gotham,
-    TextSize = 10,
-    TextXAlignment = Enum.TextXAlignment.Left
+    Position = UDim2.fromOffset(8, 0), Size = UDim2.new(1, -78, 0, 34),
+    BackgroundColor3 = THEME.Panel, BackgroundTransparency = 0.2, BorderSizePixel = 0,
+    PlaceholderText = "Type a message...", PlaceholderColor3 = THEME.Muted, Text = "",
+    ClearTextOnFocus = false, TextColor3 = THEME.White, Font = Enum.Font.Gotham,
+    TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left
 }, chat)
-corner(chatInput, 7)
-stroke(chatInput, THEME.Blue, 0.6)
-
+corner(chatInput, 7); stroke(chatInput, THEME.Blue, 0.6)
 local sendChat = button(chat, "SEND", UDim2.new(1, -62, 0, 0), UDim2.fromOffset(54, 34))
 
-local function clearChatRows()
-    for _, child in ipairs(chatList:GetChildren()) do
-        if child:IsA("Frame") then child:Destroy() end
-    end
+local function positionChatComposer()
+    local y = math.max(0, chat.AbsoluteSize.Y - 40)
+    chatInput.Position = UDim2.fromOffset(8, y)
+    sendChat.Position = UDim2.new(1, -62, 0, y)
+    if replyBar.Visible then replyBar.Position = UDim2.fromOffset(8, math.max(0, y - 28)) end
+end
+chat:GetPropertyChangedSignal("AbsoluteSize"):Connect(positionChatComposer)
+task.defer(positionChatComposer)
+
+local function setReply(item)
+    replyTo = item; privateTarget = nil; replyBar.Visible = true
+    replyLabel.Text = "↩ Replying to @" .. tostring(item.username or item.displayName or "user") .. ": " .. tostring(item.text or ""):sub(1, 45)
+    positionChatComposer(); chatInput:CaptureFocus()
+end
+local function setPrivate(item)
+    privateTarget = item; replyTo = nil; replyBar.Visible = true
+    replyLabel.Text = "Private to @" .. tostring(item.username or item.displayName or "user")
+    positionChatComposer(); chatInput:CaptureFocus()
 end
 
+local function clearChatRows()
+    for _, child in ipairs(chatList:GetChildren()) do if child:IsA("Frame") then child:Destroy() end end
+end
 local function addChatRow(item, order)
-    local row = panel(chatList, UDim2.new(), UDim2.new(1, -12, 0, 54))
-    row.LayoutOrder = order
-
+    local row = panel(chatList, UDim2.new(), UDim2.new(1, -12, 0, 62))
+    row.LayoutOrder = order; row.Active = true
+    local avatar = create("ImageLabel", {Position = UDim2.fromOffset(7, 7), Size = UDim2.fromOffset(42, 42), BackgroundColor3 = THEME.Panel, Image = getAvatar(tonumber(item.userId) or 0)}, row)
+    corner(avatar, 21)
     local name = tostring(item.displayName or item.username or "Unknown")
-    local text = tostring(item.text or "")
-    label(row, name, UDim2.fromOffset(8, 5), UDim2.new(1, -16, 0, 17), 10, THEME.LightBlue)
-    label(row, text, UDim2.fromOffset(8, 23), UDim2.new(1, -16, 0, 24), 9, THEME.Text)
+    local username = tostring(item.username or name)
+    label(row, name, UDim2.fromOffset(57, 5), UDim2.new(1, -65, 0, 16), 10, THEME.LightBlue)
+    label(row, "@" .. username, UDim2.fromOffset(57, 20), UDim2.new(1, -65, 0, 13), 7, THEME.Muted)
+    label(row, tostring(item.text or ""), UDim2.fromOffset(57, 35), UDim2.new(1, -65, 0, 22), 9, THEME.Text)
+    row.Activated:Connect(function() setPrivate(item) end)
+    row.InputBegan:Connect(function(input) if input.UserInputType == Enum.UserInputType.Touch then touchStarts[input] = input.Position end end)
+    row.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch and touchStarts[input] then
+            local delta = input.Position.X - touchStarts[input].X; touchStarts[input] = nil
+            if delta > 45 then setReply(item) end
+        end
+    end)
 end
 
 local lastChatSignature = ""
 local function refreshChat()
     local ok, data = firebaseReadMessages()
-    if not ok then
-        chatStatus.Text = "Firebase: " .. tostring(data)
-        return
-    end
-
-    clearChatRows()
+    if not ok then chatStatus.Text = "Firebase: " .. tostring(data); return end
     local items = {}
-
     if type(data) == "table" then
         for key, item in pairs(data) do
-            if type(item) == "table" then
-                item._key = tostring(key)
-                table.insert(items, item)
-            end
+            if type(item) == "table" then item._key = tostring(key); table.insert(items, item) end
         end
     end
-
-    table.sort(items, function(a, b)
-        return tonumber(a.timestamp or 0) < tonumber(b.timestamp or 0)
-    end)
-
-    -- Keep the UI lightweight.
+    table.sort(items, function(a,b) return tonumber(a.timestamp or 0) < tonumber(b.timestamp or 0) end)
     local startIndex = math.max(1, #items - 30 + 1)
     local signatureParts = {}
-    for i = startIndex, #items do
-        table.insert(signatureParts, tostring(items[i]._key) .. ":" .. tostring(items[i].text))
-    end
+    for i = startIndex, #items do table.insert(signatureParts, tostring(items[i]._key) .. ":" .. tostring(items[i].text) .. ":" .. tostring(items[i].userId)) end
     local signature = table.concat(signatureParts, "|")
-
+    -- Fix: don't clear rows unless Firebase data actually changed.
     if signature ~= lastChatSignature then
-        for i = startIndex, #items do
-            addChatRow(items[i], i)
-        end
+        clearChatRows()
+        for i = startIndex, #items do addChatRow(items[i], i) end
         lastChatSignature = signature
-        task.defer(function()
-            pcall(function()
-                chatList.CanvasPosition = Vector2.new(0, math.max(0, chatList.AbsoluteCanvasSize.Y))
-            end)
-        end)
+        task.defer(function() pcall(function() chatList.CanvasPosition = Vector2.new(0, math.max(0, chatList.AbsoluteCanvasSize.Y)) end) end)
     end
-
     chatStatus.Text = "Firebase connected • " .. tostring(#items) .. " message(s)"
 end
 
@@ -624,36 +630,20 @@ local function sendCurrentChat()
     if sending then return end
     local text = chatInput.Text
     if text:gsub("%s", "") == "" then return end
-
-    sending = true
-    sendChat.Text = "..."
-    local ok, err = firebaseSendMessage(text)
+    sending = true; sendChat.Text = "..."
+    local payloadText = text
+    if replyTo then payloadText = "↩ @" .. tostring(replyTo.username or replyTo.displayName or "user") .. ": " .. text
+    elseif privateTarget then payloadText = "Private @" .. tostring(privateTarget.username or privateTarget.displayName or "user") .. ": " .. text end
+    local ok, err = firebaseSendMessage(payloadText)
     if ok then
-        chatInput.Text = ""
-        chatStatus.Text = "Message sent."
-        task.spawn(refreshChat)
-    else
-        chatStatus.Text = tostring(err)
-        notify("Chat error: " .. tostring(err))
-    end
-    sendChat.Text = "SEND"
-    sending = false
+        chatInput.Text = ""; chatStatus.Text = replyTo and "Reply sent." or privateTarget and "Private message sent." or "Message sent."
+        replyTo = nil; privateTarget = nil; replyBar.Visible = false; positionChatComposer(); task.spawn(refreshChat)
+    else chatStatus.Text = tostring(err); notify("Chat error: " .. tostring(err)) end
+    sendChat.Text = "SEND"; sending = false
 end
-
 sendChat.Activated:Connect(sendCurrentChat)
-chatInput.FocusLost:Connect(function(enterPressed)
-    if enterPressed then sendCurrentChat() end
-end)
-
-task.spawn(function()
-    while gui and gui.Parent do
-        if main.Visible then
-            refreshChat()
-        end
-        task.wait(FIREBASE_POLL_INTERVAL)
-    end
-end)
-
+chatInput.FocusLost:Connect(function(enterPressed) if enterPressed then sendCurrentChat() end end)
+task.spawn(function() while gui and gui.Parent do if main.Visible then refreshChat() end task.wait(FIREBASE_POLL_INTERVAL) end end)
 
 -- SCRIPTS
 local scriptsPage = createPage("Scripts")
